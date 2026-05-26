@@ -38,7 +38,7 @@ conda activate probts_fm
 # Git submodule
 git submodule update --init --recursive
 
-# Install additional packages for foundation models
+# Install additional packages for foundation our_models
 pip install ".[tsfm]"
 pip uninstall -y probts # recommended to uninstall the root package (optional)
 ```

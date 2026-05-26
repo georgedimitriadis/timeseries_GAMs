@@ -54,7 +54,7 @@ class DataManager:
         auto_search: bool = False,
     ):
         """
-        DataManager class for handling datasets and preparing data for time-series models.
+        DataManager class for handling datasets and preparing data for time-series our_models.
 
         Parameters
         ----------

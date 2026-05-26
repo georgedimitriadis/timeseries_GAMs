@@ -52,7 +52,7 @@ def save_point_error(target, predict, input_dict, hor_str):
 
 def load_checkpoint(Model, checkpoint_path, scaler=None, learning_rate=None, no_training=False, **kwargs):
     # Load the checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
+    checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage, weights_only=False)
     # Extract the arguments for the forecaster
     forecaster_args = checkpoint['hyper_parameters']['forecaster']
 
@@ -99,11 +99,17 @@ def get_hor_str(prediction_length, dataloader_idx):
 
 def save_exp_summary(pl_module, inference=False):
     exp_summary = {}
-    
-    model_summary = pl_module.model_summary_callback._summary(pl_module.trainer, pl_module.model)
-    exp_summary['total_parameters'] = model_summary.total_parameters
-    exp_summary['trainable_parameters'] = model_summary.trainable_parameters
-    exp_summary['model_size'] = model_summary.model_size
+
+    if hasattr(pl_module, 'model_summary_callback'):
+        model_summary = pl_module.model_summary_callback._summary(pl_module.trainer, pl_module.model)
+        exp_summary['total_parameters'] = model_summary.total_parameters
+        exp_summary['trainable_parameters'] = model_summary.trainable_parameters
+        exp_summary['model_size'] = model_summary.model_size
+    else:
+        model_summary = None
+        exp_summary['total_parameters'] = None
+        exp_summary['trainable_parameters'] = None
+        exp_summary['model_size'] = None
     
     memory_summary = pl_module.memory_callback.memory_summary
     exp_summary['memory_summary'] = memory_summary

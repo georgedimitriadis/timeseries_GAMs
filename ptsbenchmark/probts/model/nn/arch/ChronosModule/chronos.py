@@ -307,7 +307,7 @@ class ChronosModel(nn.Module):
         """
         assert (
             self.config.model_type == "seq2seq"
-        ), "Encoder embeddings are only supported for encoder-decoder models"
+        ), "Encoder embeddings are only supported for encoder-decoder our_models"
         return self.model.encoder(
             input_ids=input_ids, attention_mask=attention_mask
         ).last_hidden_state
@@ -378,7 +378,7 @@ class ChronosPipeline(BaseChronosPipeline):
     A ``ChronosPipeline`` uses the given tokenizer and model to forecast
     input time series.
 
-    Use the ``from_pretrained`` class method to load serialized models.
+    Use the ``from_pretrained`` class method to load serialized our_models.
     Use the ``predict`` method to get forecasts.
 
     Parameters

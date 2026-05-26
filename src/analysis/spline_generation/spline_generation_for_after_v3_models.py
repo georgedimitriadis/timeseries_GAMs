@@ -14,7 +14,7 @@ from analysis.visualisation import spline_visualisation as spl_vis
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-e", "--experiment_path", default='ecmac_2025_11_27_ood_v1',
-                        help="The folder inside the results_model folder that has the models.")
+                        help="The folder inside the results_model folder that has the our_models.")
     parser.add_argument("-p", "--data_path", default='data_ood',
                         help="The base folder of the data folders in the talent_benchmark folder.")
     parser.add_argument("-d", "--dataset", default='f_8__concrete_compressive_strength__c_0',

@@ -13,7 +13,7 @@
 # limitations under the License.
 """Pax ML model for patched time-series decoder.
 
-The file implements Residual MLPs, Patched Decoder layers and PAX ML models.
+The file implements Residual MLPs, Patched Decoder layers and PAX ML our_models.
 """
 
 import dataclasses

@@ -52,7 +52,7 @@ class CSDI(Forecaster):
         input_dim = 2
         self.diffmodel = diff_CSDI(channels, diffusion_embedding_dim, side_dim, num_steps, num_heads, n_layers, inputdim=input_dim,linear=linear_trans)
 
-        # parameters for diffusion models
+        # parameters for diffusion our_models
         self.num_steps = num_steps
         if schedule == "quad":
             self.beta = np.linspace(

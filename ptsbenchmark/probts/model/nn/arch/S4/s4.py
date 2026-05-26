@@ -1621,7 +1621,7 @@ class S4(nn.Module):
         """
         d_state: the dimension of the state, also denoted by N
         l_max: the maximum kernel length, also denoted by L. Set l_max=None to always use a global kernel
-        channels: can be interpreted as a number of "heads"; the SSM is a map from a 1-dim to C-dim sequence. It's not recommended to change this unless desperate for things to tune; instead, increase d_model for larger models
+        channels: can be interpreted as a number of "heads"; the SSM is a map from a 1-dim to C-dim sequence. It's not recommended to change this unless desperate for things to tune; instead, increase d_model for larger our_models
         bidirectional: if True, convolution kernel will be two-sided
 
         Position-wise feedforward components:

@@ -177,14 +177,12 @@ class ProbTSCli(LightningCLI):
 
     def run(self):
         self.init_exp()
-        
         if not self.model.forecaster.no_training:
             self.set_fit_mode()
             if self.datamodule.dataset_val is None:  # if the validation set is empty
                 self.trainer.fit(model=self.model, train_dataloaders=self.datamodule.train_dataloader())
             else:
                 self.trainer.fit(model=self.model, datamodule=self.datamodule)
-            
             inference=False
         else:
             inference=True

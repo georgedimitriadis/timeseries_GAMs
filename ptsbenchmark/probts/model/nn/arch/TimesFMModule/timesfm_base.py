@@ -525,7 +525,7 @@ class TimesFmBase:
               covariate_value[(input_len - train_len):input_len])
           test_covariates[covariate_name].append(covariate_value[input_len:])
 
-    # Fit models.
+    # Fit our_models.
     if xreg_mode == "timesfm + xreg":
       # Forecast via TimesFM then fit a model on the residuals.
       mean_outputs, _ = self.forecast(

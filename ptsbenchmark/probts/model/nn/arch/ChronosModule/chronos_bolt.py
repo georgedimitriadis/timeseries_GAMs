@@ -500,7 +500,7 @@ class ChronosBoltPipeline(BaseChronosPipeline):
         torch.Tensor
             Forecasts of shape (batch_size, num_quantiles, prediction_length)
             where num_quantiles is the number of quantiles the model has been
-            trained to output. For official Chronos-Bolt models, the value of
+            trained to output. For official Chronos-Bolt our_models, the value of
             num_quantiles is 9 for [0.1, 0.2, ..., 0.9]-quantiles.
 
         Raises
@@ -601,7 +601,7 @@ class ChronosBoltPipeline(BaseChronosPipeline):
 
             # TODO: this is a hack that assumes the model's quantiles during training (training_quantile_levels)
             # made up an equidistant grid along the quantile dimension. i.e., they were (0.1, 0.2, ..., 0.9).
-            # While this holds for official Chronos-Bolt models, this may not be true in the future, and this
+            # While this holds for official Chronos-Bolt our_models, this may not be true in the future, and this
             # function may have to be revised.
             augmented_predictions = torch.cat(
                 [predictions[..., [0]], predictions, predictions[..., [-1]]],
