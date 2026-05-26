@@ -1,0 +1,36 @@
+# lightning==2.3.0.dev0
+seed_everything: 1
+trainer:
+  accelerator: gpu
+  devices: 1
+  strategy: auto
+  max_epochs: 30
+  use_distributed_sampler: false
+  limit_train_batches: 10
+  log_every_n_steps: 1
+  default_root_dir: ./results
+  #num_sanity_val_steps: 0     # Very important. Without it lightning runs a few validation runs before training and the code breaks.
+model:
+  forecaster:
+    class_path: our_models.vmd.VMDDecompositionForecaster
+    init_args:
+      num_decompositions: 5
+      vmd_alpha:  2000
+      vmd_tau: 0.0
+      vmd_DC: 0
+      vmd_init: 1
+      vmd_tol: 1e-7
+      encoder_hidden: 64
+      phi_scale: null
+      allow_negative_amplitude: true
+  learning_rate: 0.001
+data:
+  data_manager:
+    class_path: probts.data.data_manager.DataManager
+    init_args:
+      context_length: 96
+      split_val: true
+      scaler: standard # identity, standard, temporal
+  batch_size: 64
+  test_batch_size: 64
+  num_workers: 1

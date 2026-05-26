@@ -86,7 +86,6 @@ class ProbTSForecastModule(pl.LightningModule):
         return loss
 
     def training_step(self, batch, batch_idx):
-        print("training_step called", batch_idx)
         batch_data = ProbTSBatchData(batch, self.device)
         loss = self.training_forward(batch_data)
         self.log("train_loss", loss, on_step=True, prog_bar=True, logger=True)
