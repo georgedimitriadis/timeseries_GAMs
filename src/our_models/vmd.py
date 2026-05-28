@@ -7,12 +7,12 @@
 #      Subsequent runs load from cache — VMD never runs again for the same data.
 #   2. Each batch lookup uses a value fingerprint to find the correct VMD window
 #      from the pre-transformed dataset, O(1) per batch item.
-#   3. A CNN encoder maps VMD modes → per-mode A (amplitude) and Phi (phase).
-#   4. Differentiable FFT synthesis applies A and Phi, sums over modes → forecast.
+#   3. A shared linear layer maps each (b, f, d) mode from T_in → T_in+T_out.
+#   4. The last T_out outputs are un-normalised and summed over D → forecast.
 #
 # Gradient flow:
 #   VMD and data loading have NO gradient.
-#   Gradients flow: Encoder → A, Phi → fft_phase_shift → output.
+#   Gradients flow through: Linear layer weights → output.
 #
 # Dependencies:
 #   pip install vmdpy
@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Union, List, Optional, Dict, Tuple
 
 import numpy as np
-from scipy.signal import correlate2d
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,102 +35,9 @@ from probts.model.forecaster import Forecaster
 log = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────────
-# 1. Differentiable FFT phase shift
-# ─────────────────────────────────────────────────────────────────────────────────
-
-def fft_phase_shift(x: torch.Tensor, phi: torch.Tensor, T_out: int) -> torch.Tensor:
-    """
-    Shift each signal in x by phi samples (fractional, learnable), resample to T_out.
-
-    Args:
-        x   : [N, T_in]   real signals
-        phi : [N]         shift in samples (fractional, differentiable)
-        T_out             desired output length
-
-    Returns: [N, T_out]
-
-    Note: irfft(n=T_out) naturally handles T_out ≠ T_in via zero-padding or
-    truncation in the frequency domain. For band-limited periodic signals (VMD
-    modes), this is exact.
-    """
-    T_in = x.shape[-1]
-    X = torch.fft.rfft(x, n=T_in)
-    freqs = torch.fft.rfftfreq(T_in, device=x.device)          # [T_in//2+1]
-    phase = torch.exp(
-        torch.complex(
-            torch.zeros_like(phi.unsqueeze(-1).expand(-1, freqs.shape[0])),
-            -2.0 * torch.pi * freqs.unsqueeze(0) * phi.unsqueeze(-1),
-        )
-    )
-    return torch.fft.irfft(X * phase, n=T_out)                 # [N, T_out]
-
-
-
-def _gluonts_time_features(dates: "pd.DatetimeIndex", freq: str) -> np.ndarray:
-    """
-    Compute time features using GluonTS's own machinery so that the result
-    matches the values that GluonTS puts into past_time_feat in the batch.
-
-    Falls back to ProbTS's time_features() if gluonts is unavailable.
-
-    Returns: float32 array [T, D]
-    """
-    try:
-        from gluonts.time_feature import time_features_from_frequency_str
-        feat_fns = time_features_from_frequency_str(freq)
-        stamp = np.column_stack([f(dates) for f in feat_fns]).astype(np.float32)
-        return stamp                                          # [T, D]
-    except Exception:
-        # Fallback to ProbTS implementation
-        from probts.data.data_utils.time_features import time_features as tf_fn
-        return tf_fn(dates, freq=freq).T.astype(np.float32)  # [T, D]
 
 # ─────────────────────────────────────────────────────────────────────────────────
-# 2. Mode encoder  (VMD modes → A and Phi)
-# ─────────────────────────────────────────────────────────────────────────────────
-
-class ModeEncoder(nn.Module):
-    """
-    Maps one feature's D VMD modes [N, D, T_in] → A [N, D], Phi [N, D].
-    N = B * F (batch × features, processed jointly with shared weights).
-    """
-
-    def __init__(self, D: int, hidden: int = 64):
-        super().__init__()
-        self.D = D
-        self.cnn = nn.Sequential(
-            nn.Conv1d(D, hidden, kernel_size=7, padding=3),
-            nn.GELU(),
-            nn.Conv1d(hidden, hidden, kernel_size=5, padding=2),
-            nn.GELU(),
-            nn.AdaptiveAvgPool1d(1),
-        )
-        self.head = nn.Sequential(
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, 2 * D),
-        )
-
-    def forward(self, modes: torch.Tensor):
-        h = self.cnn(modes).squeeze(-1)
-        out = self.head(h)
-        return out[:, :self.D], out[:, self.D:]                 # A_raw, Phi_raw
-
-
-# ─────────────────────────────────────────────────────────────────────────────────
-# 3. Raw data loader  (via ProbTS infrastructure)
-# ─────────────────────────────────────────────────────────────────────────────────
-# load_dataset() from probts.data.data_utils.get_datasets handles every format
-# ProbTS supports (ETT CSVs, traffic, CAISO, Monash .tsf, etc.).
-# get_dataset_info() maps a dataset name to its relative file path + frequency,
-# so the caller only needs to supply the root folder, not the file path.
-# For datasets not in get_dataset_info's built-in table, pass custom_data_file.
-# ─────────────────────────────────────────────────────────────────────────────────
-
-
-# ─────────────────────────────────────────────────────────────────────────────────
-# 4. Main model
+# 3. Main model
 # ─────────────────────────────────────────────────────────────────────────────────
 
 class VMDDecompositionForecaster(Forecaster):
@@ -163,12 +69,6 @@ class VMDDecompositionForecaster(Forecaster):
             Centre-frequency init: 1 = uniform, 2 = random.
         vmd_tol (float):
             Convergence tolerance.
-        encoder_hidden (int):
-            CNN encoder hidden size.
-        phi_scale (float | None):
-            Phase shift range ±phi_scale samples. Defaults to context_length.
-        allow_negative_amplitude (bool):
-            True = amplitudes can be negative (modes can cancel each other).
     """
 
     def __init__(
@@ -182,44 +82,51 @@ class VMDDecompositionForecaster(Forecaster):
         vmd_DC: int = 0,
         vmd_init: int = 1,
         vmd_tol: float = 1e-7,
-        encoder_hidden: int = 64,
-        phi_scale: Optional[float] = None,
-        allow_negative_amplitude: bool = True,
+        dropout: float = 0.1,
+        l2_lambda: float = 0.01,
         **kwargs,
     ):
         super().__init__(**kwargs)
 
-        # data_root_path: root folder containing all dataset subdirectories,
-        #   e.g. /data/  (same value you pass to DataManager as root_path).
-        # custom_data_file: relative path inside data_root_path for datasets
-        #   not listed in get_dataset_info, e.g. 'my_project/series.csv'.
-        #   Leave as None for any built-in ProbTS dataset name.
-        self.data_root_path = data_root_path
-        self.vmd_cache_path = vmd_cache_path
+        self.data_root_path  = data_root_path
+        self.vmd_cache_path  = vmd_cache_path
         self.custom_data_file = custom_data_file
-        self.D = num_decompositions
-        self.vmd_alpha = vmd_alpha
-        self.vmd_tau = vmd_tau
-        self.vmd_DC = vmd_DC
-        self.vmd_init = vmd_init
-        self.vmd_tol = vmd_tol
-        self.allow_negative_amplitude = allow_negative_amplitude
-        self.phi_scale = float(phi_scale or self.max_context_length)
+        self.D               = num_decompositions
+        self.vmd_alpha       = vmd_alpha
+        self.vmd_tau         = vmd_tau
+        self.vmd_DC          = vmd_DC
+        self.vmd_init        = vmd_init
+        self.vmd_tol         = vmd_tol
 
-        self.encoder = ModeEncoder(D=self.D, hidden=encoder_hidden)
+        # Two-layer structure mirroring LinearForecaster (individual=False):
+        #   self.linear     : time projection   T_in  → T_out   (per F*D channel)
+        #   self.out_linear : feature projection F*D   → F       (per time step)
+        T_in  = self.max_context_length
+        T_out = self.max_prediction_length
+        self.linear     = nn.Linear(T_in, T_out)
+        #self.out_linear = nn.Linear(self.target_dim * self.D, self.target_dim)
+        self.out_linear = nn.Sequential(
+            nn.Linear(self.target_dim * self.D, self.target_dim * self.D // 2),
+            nn.GELU(),
+            nn.Linear(self.target_dim * self.D // 2, self.target_dim),
+        )
+        self.dropout    = nn.Dropout(p=dropout)
+        self.l2_lambda  = l2_lambda
         self.loss_fn = nn.MSELoss(reduction="none")
         self.loss_call_count = 0
 
         # Populated by _ensure_vmd_ready()
-        # _vmd_modes_list : List[np.ndarray]  each [F, D, T_n]
-        # _raw_series_list: List[np.ndarray]  each [T_n, F]
-        # _data_stamp     : np.ndarray [T_full, time_feat_dim]  (long-term datasets)
-        # _position_cache : Dict[bytes, Tuple[int, int]]
-        #                   time-feature key → (series_idx, window_start)
-        self._vmd_modes_list:  Optional[List[np.ndarray]] = None
+        # _raw_series_list  : flat list of all [T_n, F] arrays
+        # _vmd_modes_list   : flat list of all [F, D, T_n] arrays
+        # _train_indices    : which indices in the above lists to search during training
+        # _test_indices     : which indices to search during evaluation/forecast
+        # _train_cache / _test_cache : separate sign-key → (series_idx, t) caches
         self._raw_series_list: Optional[List[np.ndarray]] = None
-        self._data_stamp:      Optional[np.ndarray] = None
-        self._position_cache:  Dict[bytes, Tuple[int, int]] = {}
+        self._vmd_modes_list:  Optional[List[np.ndarray]] = None
+        self._train_indices:   List[int] = []
+        self._test_indices:    List[int] = []
+        self._train_cache:     Dict[bytes, Tuple[int, int]] = {}
+        self._test_cache:      Dict[bytes, Tuple[int, int]] = {}
         self._vmd_ready = False
 
     # ── Step 1: ensure VMD data is ready ─────────────────────────────────────────
@@ -250,8 +157,7 @@ class VMDDecompositionForecaster(Forecaster):
             self._raw_series_list = raw_series
             vmd_modes = self._vmd_transform_all(raw_series)
             self._vmd_modes_list = vmd_modes
-            log.info(f"_data_stamp before save: {None if self._data_stamp is None else self._data_stamp.shape}")
-            self._save_vmd_cache(cache, raw_series, vmd_modes)
+            self._save_vmd_cache(cache)
 
         self._vmd_ready = True
         log.info(
@@ -307,16 +213,11 @@ class VMDDecompositionForecaster(Forecaster):
 
         # ── Case 1: Long-term dataset ─────────────────────────────────────────
         # load_dataset() returns a pandas DataFrame [T, F] (full, unsplit).
-        # data_stamp [T, time_feat_dim] encodes the timestamp of every row
-        # and is used later to locate batch windows by time, not by value.
         if isinstance(raw, pd.DataFrame):
             arr = raw.values.astype(np.float64)
             log.info(f"Long-term series shape: {arr.shape}")
-            if hasattr(dm, 'data_stamp') and dm.data_stamp is not None:
-                self._data_stamp = np.array(dm.data_stamp, dtype=np.float32)
-                log.info(f"data_stamp shape: {self._data_stamp.shape}")
-            else:
-                log.warning("data_stamp not available — will fall back to z-norm search")
+            self._train_indices = [0]
+            self._test_indices  = [0]
             return [arr]
 
         # ── Case 2: Short-term GluonTS repository dataset ─────────────────────
@@ -324,34 +225,27 @@ class VMDDecompositionForecaster(Forecaster):
         # Multivariate datasets need grouping before extraction.
         if hasattr(raw, 'train') and hasattr(raw, 'test'):
             if self.dataset in MULTI_VARIATE_DATASETS:
-                # Use raw.TRAIN (not raw.test) so the series starts at the
-                # training data origin (e.g. 2014-01-01 for electricity_nips).
-                # All context windows in training AND test batches come from
-                # the training time-range, so this covers both.
-                train_grouper = MultivariateGrouper(max_target_dim=int(dm.target_dim))
-                grouped = list(train_grouper(raw.train))
-                item = grouped[0]
-                arr  = item["target"].T.astype(np.float64)          # [T_train, F]
-                log.info(f"GluonTS MV series shape: {arr.shape}")
-
-                # Build data_stamp from the item's start timestamp + freq
-                T_n   = arr.shape[0]
-                raw_start = item["start"]
-                log.info(f"  item start={raw_start!r}  type={type(raw_start).__name__}  dm.freq={dm.freq!r}")
-                try:
-                    if hasattr(raw_start, 'to_timestamp'):
-                        ts0 = raw_start.to_timestamp()
-                    else:
-                        ts0 = pd.Timestamp(raw_start)
-                    dates = pd.date_range(start=ts0, periods=T_n, freq=dm.freq)
-                    self._data_stamp = _gluonts_time_features(dates, dm.freq)
-                    log.info(f"  data_stamp shape: {self._data_stamp.shape}")
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"Failed to build data_stamp for '{self.dataset}': {exc} "
-                        f"start={raw_start!r} freq={dm.freq!r} T_n={T_n}"
-                    ) from exc
-                return [arr]
+                # We need BOTH train and test series:
+                #   raw.train → covers training context windows
+                #   raw.test  → covers test context windows in the test period
+                # Both are stored separately so _find_window_start searches both.
+                num_test_dates = int(len(raw.test) / len(raw.train))
+                train_grouper = MultivariateGrouper(
+                    max_target_dim=int(dm.target_dim)
+                )
+                test_grouper = MultivariateGrouper(
+                    num_test_dates=num_test_dates,
+                    max_target_dim=int(dm.target_dim)
+                )
+                arr_train = list(train_grouper(raw.train))[0]["target"].T.astype(np.float64)
+                # Use [-1] (the longest grouped series) so the test raw data
+                # covers the full test period, not just the first rolling window.
+                arr_test  = list(test_grouper(raw.test))[-1]["target"].T.astype(np.float64)
+                log.info(f"GluonTS MV train series: {arr_train.shape}")
+                log.info(f"GluonTS MV test  series: {arr_test.shape}")
+                self._train_indices = [0]
+                self._test_indices  = [1]
+                return [arr_train, arr_test]
             else:
                 # Univariate: one array per series item in the test split.
                 series_list = []
@@ -363,24 +257,8 @@ class VMDDecompositionForecaster(Forecaster):
                         arr = arr.T                     # [F, T] → [T, F]
                     series_list.append(arr)
                 log.info(f"GluonTS UV: {len(series_list)} series loaded")
-                # Build data_stamp from the first item (all share the same timeline)
-                first     = list(raw.test)[0]
-                T_n       = len(series_list[0])
-                raw_start = first["start"]
-                log.info(f"  item start={raw_start!r}  type={type(raw_start).__name__}  dm.freq={dm.freq!r}")
-                try:
-                    if hasattr(raw_start, 'to_timestamp'):
-                        ts0 = raw_start.to_timestamp()
-                    else:
-                        ts0 = pd.Timestamp(raw_start)
-                    dates = pd.date_range(start=ts0, periods=T_n, freq=dm.freq)
-                    self._data_stamp = _gluonts_time_features(dates, dm.freq)
-                    log.info(f"  data_stamp shape: {self._data_stamp.shape}")
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"Failed to build data_stamp for '{self.dataset}': {exc} "
-                        f"start={raw_start!r} freq={dm.freq!r} T_n={T_n}"
-                    ) from exc
+                self._train_indices = list(range(len(series_list)))
+                self._test_indices  = list(range(len(series_list)))
                 return series_list
 
         # ── Case 3: GIFT eval dataset ─────────────────────────────────────────
@@ -395,6 +273,8 @@ class VMDDecompositionForecaster(Forecaster):
                     arr = arr.T                         # [F, T] → [T, F]
                 series_list.append(arr)
             log.info(f"GIFT eval: {len(series_list)} series loaded")
+            self._train_indices = list(range(len(series_list)))
+            self._test_indices  = list(range(len(series_list)))
             return series_list
 
         raise ValueError(
@@ -448,17 +328,15 @@ class VMDDecompositionForecaster(Forecaster):
 
     # ── Step 3: persist / restore cache ──────────────────────────────────────────
 
-    def _save_vmd_cache(
-        self,
-        cache_path: Path,
-        raw_series: List[np.ndarray],
-        vmd_modes: List[np.ndarray],
-    ):
+    def _save_vmd_cache(self, cache_path: Path):
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        raw_dict  = {f"raw_{i}": arr for i, arr in enumerate(raw_series)}
-        vmd_dict  = {f"vmd_{i}": arr for i, arr in enumerate(vmd_modes)}
-        stamp_kw  = {"data_stamp": self._data_stamp} if self._data_stamp is not None else {}
-        np.savez_compressed(cache_path, **raw_dict, **vmd_dict, **stamp_kw)
+        raw_dict  = {f"raw_{i}": arr for i, arr in enumerate(self._raw_series_list)}
+        vmd_dict  = {f"vmd_{i}": arr for i, arr in enumerate(self._vmd_modes_list)}
+        idx_dict  = {
+            "train_indices": np.array(self._train_indices, dtype=np.int32),
+            "test_indices":  np.array(self._test_indices,  dtype=np.int32),
+        }
+        np.savez_compressed(cache_path, **raw_dict, **vmd_dict, **idx_dict)
         log.info(f"VMD cache saved to {cache_path}")
 
     def _load_vmd_cache(self, cache_path: Path):
@@ -466,196 +344,187 @@ class VMDDecompositionForecaster(Forecaster):
         n = sum(1 for k in data.files if k.startswith("raw_"))
         self._raw_series_list = [data[f"raw_{i}"] for i in range(n)]
         self._vmd_modes_list  = [data[f"vmd_{i}"] for i in range(n)]
-        if "data_stamp" in data.files:
-            self._data_stamp = data["data_stamp"]
-            log.info(f"Loaded data_stamp {self._data_stamp.shape} from cache")
-        else:
-            log.warning("Cache has no data_stamp — delete cache to regenerate with timestamp support")
+        self._train_indices   = data["train_indices"].tolist()
+        self._test_indices    = data["test_indices"].tolist()
+        log.info(f"train_indices={self._train_indices}  test_indices={self._test_indices}")
+
 
     # ── Step 4: build fingerprint → (series_idx, window_start) index ─────────────
 
-    @staticmethod
-    def _find_submatrix_origin(large: np.ndarray, small: np.ndarray) -> tuple:
-        """
-        Find the row position in `large` [T, F] where `small` [n, F] begins,
-        using 2-D cross-correlation as a fast similarity measure.
+    # Number of sign-diff steps used as the search probe.
+    # 10 steps × F features gives 10×F bits — collision-proof for any real dataset
+    # while keeping the BLAS matrix-vector multiply very fast.
+    _N_PROBE: int = 10
 
-        Both matrices must have the same number of columns (features F).
-        The search is along the time axis only (columns are never shifted).
+    @staticmethod
+    def _find_submatrix_origin(large: np.ndarray, small: np.ndarray,
+                               n_probe: int = 10) -> tuple:
+        """
+        Find the row in `large` [T, F] where `small` [n, F] begins.
+
+        Uses the first n_probe rows of `small` as the search key and a
+        BLAS matrix-vector multiply for the scan — O(T × n_probe × F) in
+        float32, which is orders of magnitude faster than correlate2d.
 
         Returns:
-            (row,)  — start row of `small` inside `large`
+            (row,)  — start row index
 
         Raises:
-            ValueError  if no close match is found (best normalised correlation < 0.99)
+            ValueError  if the best correlation ratio < 0.99
         """
-        large_f = large.astype(np.float64)
-        small_f = small.astype(np.float64)
+        n_probe = min(n_probe, small.shape[0])
+        probe   = small[:n_probe].astype(np.float32)        # [n_probe, F]
+        large_f = large.astype(np.float32)                  # [T, F]
 
-        # correlate2d with mode='valid' slides small over large along axis-0;
-        # result shape is (T - n + 1, 1) because columns always align fully.
-        corr = correlate2d(large_f, small_f, mode='valid')  # [T-n+1, 1]
-        row  = int(np.argmax(corr[:, 0]))
+        T, F = large_f.shape
+        if T < n_probe:
+            raise ValueError("series shorter than probe")
 
-        # Normalised check: perfect sign match → corr == sum(small**2)
-        expected = float(np.sum(small_f ** 2))
-        achieved = float(corr[row, 0])
+        n_valid = T - n_probe + 1                           # number of candidate positions
+
+        # Build sliding windows [n_valid, n_probe, F] via stride tricks (no copy)
+        wins = np.lib.stride_tricks.sliding_window_view(
+            large_f, (n_probe, F)
+        )[:, 0, :, :]                                       # [n_valid, n_probe, F]
+
+        # Flatten last two dims and use BLAS DGEMV: [n_valid, n_probe*F] @ [n_probe*F]
+        probe_flat = probe.ravel()                          # [n_probe*F]
+        wins_flat  = np.ascontiguousarray(
+            wins.reshape(n_valid, n_probe * F)
+        )                                                   # [n_valid, n_probe*F]
+        corr = wins_flat @ probe_flat                       # [n_valid]  — pure BLAS
+
+        row = int(np.argmax(corr))
+
+        expected = float(np.dot(probe_flat, probe_flat))
+        achieved = float(corr[row])
 
         if expected > 0 and (achieved / expected) < 0.99:
             raise ValueError(
-                f"No definite match found — best correlation {achieved:.2f} / "
-                f"expected {expected:.2f} (ratio {achieved/expected:.3f} < 0.99). "
-                f"The context window sign pattern does not appear in the raw series."
+                f"No definite match — ratio {achieved/expected:.3f} < 0.99"
             )
 
         return (row,)
 
-    def _find_window_start(self, context: np.ndarray) -> Tuple[int, int]:
+    def _find_window_start(self, context: np.ndarray,
+                           indices: List[int]) -> Tuple[int, int]:
         """
-        Find where this context window appears in the raw series by correlating
-        the sign-of-differences patterns.
-
-        sign(diff) is invariant to any monotone per-feature transformation
-        (z-score, CDF normalisation, mean-scaling, etc.), so this works even
-        when past_target_cdf has been normalised by the DataManager.
-
-        Steps:
-          1. Compute sign(diff(context))  →  [ctx-1, F]  probe pattern
-          2. Compute sign(diff(series))   →  [T-1, F]    haystack
-          3. Use 2-D cross-correlation to find the row where the probe appears
-          4. Raise ValueError if no definite match (correlation ratio < 0.99)
+        Locate context window in the raw series via sign-of-diff correlation.
 
         Args:
-            context : [ctx, F]  float32 context window from the batch
+            context : [ctx, F]  float32
+            indices : which entries of _raw_series_list to search
 
         Returns:
-            (series_idx, window_start)
+            (series_idx, window_start)  — series_idx is an absolute index
 
         Raises:
-            ValueError  if no matching position is found in any series
+            ValueError  if no match found in the given series subset
         """
-        # Use all ctx-1 difference steps for maximum discriminability
         sign_ctx = np.sign(
-            np.diff(context.astype(np.float64), axis=0)
+            np.diff(context.astype(np.float32), axis=0)
         )                                                    # [ctx-1, F]
 
-        for s_idx, series in enumerate(self._raw_series_list):
-            T = series.shape[0]
+        for s_idx in indices:
+            series = self._raw_series_list[s_idx]
+            T   = series.shape[0]
             ctx = self.max_context_length
             if T < ctx:
                 continue
 
-            sign_raw = np.sign(
-                np.diff(series[:T - ctx + ctx, :].astype(np.float64), axis=0)
-            )                                                # [T-1, F]
-
-            # Restrict haystack so t + ctx <= T (only valid start positions)
-            max_valid_row = T - ctx                         # sign index max_valid_row
-            # sign_raw[t : t+ctx-1] corresponds to series[t : t+ctx]
-            sign_hay = sign_raw[:max_valid_row + ctx - 1]   # [max_valid_row + ctx - 1, F]
+            # Only include positions t where t + ctx <= T
+            sign_hay = np.sign(
+                np.diff(series[:T, :].astype(np.float32), axis=0)
+            )[:T - ctx + ctx - 1]                           # [T-ctx+ctx-1, F] = [T-1, F]
 
             try:
-                (row,) = self._find_submatrix_origin(sign_hay, sign_ctx)
+                (row,) = self._find_submatrix_origin(
+                    sign_hay, sign_ctx, n_probe=self._N_PROBE
+                )
                 return (s_idx, row)
             except ValueError:
                 continue
 
         raise ValueError(
-            f"_find_window_start: context window not found in any raw series. "
-            f"context shape={context.shape}, "
-            f"context[:3, :3]={context[:3, :3]}"
+            f"_find_window_start: no match in series {indices}. "
+            f"context shape={context.shape}, context[:3,:3]={context[:3, :3]}"
         )
 
-    def _get_vmd_batch(self, batch_data) -> torch.Tensor:
+    def _get_vmd_batch(self, batch_data,
+                       indices: List[int],
+                       cache:   Dict[bytes, Tuple[int, int]]) -> torch.Tensor:
         """
-        For each item in the batch, locate its position in the pre-transformed
-        dataset then slice the corresponding VMD modes.
+        Locate each batch item in the specified series subset and return modes.
+
+        Args:
+            indices : series indices to search (train or test subset)
+            cache   : position cache for this subset (train or test)
 
         Returns: [B, F, D, ctx]  on the same device as past_target_cdf
         """
-        ctx    = self.max_context_length
-        device = batch_data.past_target_cdf.device
+        ctx     = self.max_context_length
+        device  = batch_data.past_target_cdf.device
         past_np = batch_data.past_target_cdf.cpu().numpy().astype(np.float32)
         B       = past_np.shape[0]
 
         batch_modes = np.zeros((B, self.target_dim, self.D, ctx), dtype=np.float32)
 
         for b in range(B):
-            context = past_np[b, -ctx:]                      # [ctx, F]
-
-            # Cache key: exact sign pattern — no rounding, no precision issues
+            context   = past_np[b, -ctx:]                   # [ctx, F]
             signs_key = np.sign(
                 np.diff(context[:10], axis=0)
             ).astype(np.int8).tobytes()
 
-            if signs_key not in self._position_cache:
-                self._position_cache[signs_key] = self._find_window_start(context)
+            if signs_key not in cache:
+                cache[signs_key] = self._find_window_start(context, indices)
 
-            s_idx, t = self._position_cache[signs_key]
-            modes = self._vmd_modes_list[s_idx]              # [F, D, T_total]
-            T_n   = modes.shape[2]
-            t     = min(t, T_n - ctx)                        # clamp: never overshoot
-            batch_modes[b] = modes[:, :, t: t + ctx]         # [F, D, ctx]
+            s_idx, t = cache[signs_key]
+            modes    = self._vmd_modes_list[s_idx]           # [F, D, T_total]
+            t        = min(t, modes.shape[2] - ctx)
+            batch_modes[b] = modes[:, :, t: t + ctx]
 
         return torch.tensor(batch_modes, device=device)
 
 
-    # ── Core synthesis (differentiable) ──────────────────────────────────────────
-
-    def _synthesize(self, modes: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            modes: [B, F, D, T_in]
-
-        Returns:
-            [B, F, T_out]
-        """
-        B, Fv, D, T_in = modes.shape
-        T_out = self.max_prediction_length
-
-        modes_bf = modes.view(B * Fv, D, T_in)
-        A_raw, Phi_raw = self.encoder(modes_bf)             # each [B*F, D]
-
-        A   = A_raw if self.allow_negative_amplitude else F.softplus(A_raw)
-        Phi = torch.tanh(Phi_raw) * self.phi_scale
-
-        modes_bfd = modes_bf.reshape(B * Fv * D, T_in)
-        phi_bfd   = Phi.reshape(B * Fv * D)
-
-        shifted = fft_phase_shift(modes_bfd, phi_bfd, T_out)   # [B*F*D, T_out]
-        shifted = shifted.view(B, Fv, D, T_out)
-
-        output = (A.view(B, Fv, D).unsqueeze(-1) * shifted).sum(dim=2)  # [B, F, T_out]
-        return output
+    # ── Core forward ─────────────────────────────────────────────────────────────
 
     def forward(self, modes: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            modes: [B, F, D, T_in]   — pre-looked-up VMD modes
+            modes : [B, F, D, T_in]  — VMD modes for the context window
 
         Returns:
             [B, T_out, F]
 
-        RevIN-style per-feature normalisation is applied before synthesis and
-        reversed afterwards.  This keeps the encoder inputs in a well-conditioned
-        range regardless of the raw data scale (e.g. kWh in the thousands for
-        electricity datasets), preventing the exploding-loss cold-start problem.
+        Mirrors LinearForecaster (individual=False) with VMD modes as input:
+
+          1. Per-mode instance normalisation (mean/std over T_in) — stabilises
+             inputs regardless of raw data scale.
+          2. Flatten F and D → treat as F*D independent channels: [B, F*D, T_in].
+          3. self.linear     [T_in → T_out]  — time projection per channel,
+             same role as LinearForecaster.linear.
+          4. self.out_linear [F*D  → F]      — feature projection per time step,
+             same role as LinearForecaster.out_linear.
         """
-        # ── Per-feature normalisation (mean/std across D and T) ───────────────
-        # modes: [B, F, D, T_in]
-        mu  = modes.mean(dim=(-2, -1), keepdim=True)              # [B, F, 1, 1]
-        sig = modes.std( dim=(-2, -1), keepdim=True).clamp(1e-8)  # [B, F, 1, 1]
-        modes_norm = (modes - mu) / sig                            # [B, F, D, T_in]
+        B, Fv, D, T_in = modes.shape
 
-        # ── Synthesis in normalised space ─────────────────────────────────────
-        out_norm = self._synthesize(modes_norm)                    # [B, F, T_out]
+        # ── 1. Per-mode normalisation (over the T_in dimension) ───────────────
+        mu  = modes.mean(dim=-1, keepdim=True)              # [B, F, D, 1]
+        sig = modes.std( dim=-1, keepdim=True).clamp(1e-8)  # [B, F, D, 1]
+        modes_norm = (modes - mu) / sig                     # [B, F, D, T_in]
 
-        # ── Un-normalise back to original scale ───────────────────────────────
-        mu_2d  = mu.squeeze(-1).squeeze(-1)                        # [B, F]
-        sig_2d = sig.squeeze(-1).squeeze(-1)                       # [B, F]
-        output = out_norm * sig_2d.unsqueeze(-1) + mu_2d.unsqueeze(-1)  # [B, F, T_out]
+        # ── 2. Flatten F and D into one channel dimension ─────────────────────
+        x = self.dropout(modes_norm.reshape(B, Fv * D, T_in))  # [B, F*D, T_in]
 
-        return output.permute(0, 2, 1)                             # [B, T_out, F]
+        # ── 3. Time projection: T_in → T_out  (applied to last dim) ──────────
+        # Matches LinearForecaster: linear(x.permute(0,2,1)).permute(0,2,1)
+        x = self.linear(x)                                  # [B, F*D, T_out]
+
+        # ── 4. Feature projection: F*D → F  (applied to last dim) ────────────
+        x = x.permute(0, 2, 1)                              # [B, T_out, F*D]
+        x = self.out_linear(x)                              # [B, T_out, F]
+
+        return x                                            # [B, T_out, F]
 
     # ── ProbTS interface ──────────────────────────────────────────────────────────
 
@@ -663,31 +532,24 @@ class VMDDecompositionForecaster(Forecaster):
         self._ensure_vmd_ready()
         self.loss_call_count += 1
 
-        if not getattr(self, '_batch_diagnosed', False):
-            '''
-            self._batch_diagnosed = True
-            print("\n=== batch_data fields ===")
-            for name in vars(batch_data):
-                val = getattr(batch_data, name)
-                if hasattr(val, 'shape'):
-                    print(f"  {name}: {val.shape}  dtype={val.dtype}")
-                else:
-                    print(f"  {name}: {type(val).__name__} = {val}")
-            print("=========================\n")
-            # Save past_target_cdf to disk for inspection
-            save_path = Path(self.vmd_cache_path).parent / "past_target_cdf_sample.npy"
-            np.save(save_path, batch_data.past_target_cdf.cpu().numpy())
-            log.info(f"Saved past_target_cdf sample to {save_path}")
-        '''
         if self.use_scaling:
             self.get_scale(batch_data)
 
-        modes   = self._get_vmd_batch(batch_data)              # [B, F, D, ctx]
+        modes   = self._get_vmd_batch(batch_data,
+                                   self._train_indices,
+                                   self._train_cache)        # [B, F, D, ctx]
         outputs = self(modes)                                   # [B, T_out, F]
 
         loss = self.loss_fn(batch_data.future_target_cdf, outputs)
         loss = self.get_weighted_loss(batch_data, loss)
         result = loss.mean()
+
+        # L2 regularisation on both linear layers (equivalent to weight decay)
+        if self.l2_lambda > 0:
+            l2 = sum(p.pow(2).sum()
+                     for p in list(self.linear.parameters()) +
+                              list(self.out_linear.parameters()))
+            result = result + self.l2_lambda * l2
 
         print(f"[loss call {self.loss_call_count:>6}]  loss={result.item():.6f}")
         return result
@@ -698,7 +560,9 @@ class VMDDecompositionForecaster(Forecaster):
         if self.use_scaling:
             self.get_scale(batch_data)
 
-        modes     = self._get_vmd_batch(batch_data)            # [B, F, D, ctx]
+        modes     = self._get_vmd_batch(batch_data,
+                                     self._test_indices,
+                                     self._test_cache)       # [B, F, D, ctx]
         forecasts = self(modes).unsqueeze(1)                   # [B, 1, T_out, F]
         return forecasts
 
@@ -716,9 +580,6 @@ class VMDDecompositionForecaster(Forecaster):
 #         custom_data_file: null               # only for unknown dataset names
 #         num_decompositions: 5
 #         vmd_alpha: 2000.0
-#         encoder_hidden: 64
-#         phi_scale: null
-#         allow_negative_amplitude: true
 #     learning_rate: 0.001
 #
 #   data:

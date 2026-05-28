@@ -9,7 +9,6 @@ trainer:
   limit_train_batches: 50
   log_every_n_steps: 1
   default_root_dir: ./results
-  #num_sanity_val_steps: 0     # Very important. Without it lightning runs a few validation runs before training and the code breaks.
 model:
   forecaster:
     class_path: our_models.vmd.VMDDecompositionForecaster
@@ -22,10 +21,9 @@ model:
       vmd_DC: 0
       vmd_init: 1
       vmd_tol: 1e-7
-      encoder_hidden: 64
-      phi_scale: null
-      allow_negative_amplitude: true
-  learning_rate: 0.001
+      dropout: 0
+      l2_lambda: 0
+  learning_rate: 0.005
 data:
   data_manager:
     class_path: probts.data.data_manager.DataManager
