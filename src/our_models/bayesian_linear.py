@@ -21,6 +21,7 @@ class BayesianLinearForecaster(Forecaster):
             self,
             individual: bool = True,
             kl_weight: float= 1.0,
+            init_sigma: float = -1,
             n_train_batches: int = 100,
             **kwargs
     ):
@@ -36,11 +37,11 @@ class BayesianLinearForecaster(Forecaster):
             for i in range(self.input_size):
                 self.linear.append(nn.Linear(self.context_length, self.prediction_length))
                 self.weight_mu.append(nn.Parameter(torch.zeros(self.prediction_length, self.context_length)))
-                self.weight_logsigma.append(nn.Parameter(torch.full((self.prediction_length, self.context_length), -5.0)))
+                self.weight_logsigma.append(nn.Parameter(torch.full((self.prediction_length, self.context_length), init_sigma)))
         else:
             self.linear = nn.Linear(self.context_length, self.prediction_length)
             self.weight_mu = nn.Parameter(torch.zeros(self.prediction_length, self.context_length))
-            self.weight_logsigma = nn.Parameter(torch.full((self.prediction_length, self.context_length), -5.0))
+            self.weight_logsigma = nn.Parameter(torch.full((self.prediction_length, self.context_length), init_sigma))
 
         self.out_linear = nn.Linear(self.input_size, self.target_dim)
         self.loss_fn = nn.MSELoss(reduction='none')
