@@ -1,0 +1,51 @@
+# lightning==2.3.0.dev0
+seed_everything: 0
+trainer:
+  accelerator: gpu
+  devices: 1
+  strategy: auto
+  max_epochs: 30
+  use_distributed_sampler: false
+  limit_train_batches: 100
+  log_every_n_steps: 1
+  default_root_dir: ./results
+model:
+  forecaster:
+    class_path: our_models.multires_spline_dlinear.MultiresSplineDLinear
+    init_args:
+      kernel_size: 3
+      individual: false
+      num_parallel_samples: 100
+      spline_resolutions:
+        - 2
+        - 4
+        - 16
+        - 64
+      spline_knot_min: -2.0
+      spline_knot_max: 2.0
+      spline_init_weight_std: 0.02
+      spline_init_affine_weight: 1.0
+      spline_init_affine_bias: 0.0
+      use_lags: true
+      use_feat_idx_emb: true
+      use_time_feat: false
+  learning_rate: 0.01
+  quantiles_num: 20
+  optimizer_config:
+    class_name: torch.optim.Adam
+    init_args:
+      lr: 0.001
+      eps: 1.0e-4
+      weight_decay: 0.0
+      betas: [ 0.9, 0.999 ]
+data:
+  data_manager:
+    class_path: probts.data.data_manager.DataManager
+    init_args:
+      context_length: 96        # required for long-term datasets
+      prediction_length: 96     # required for long-term datasets
+      split_val: true
+      scaler: standard # identity, standard, temporal
+  batch_size: 32
+  test_batch_size: 32
+  num_workers: 10

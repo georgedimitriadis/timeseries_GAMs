@@ -4,17 +4,22 @@ trainer:
   accelerator: cpu
   devices: 1
   strategy: auto
-  max_epochs: 30
+  max_epochs: 1
   use_distributed_sampler: false
   limit_train_batches: 100
   log_every_n_steps: 1
   default_root_dir: ./results
+  num_sanity_val_steps: 0
 model:
   forecaster:
-    class_path: probts.model.forecaster.point_forecaster.LinearForecaster
+    class_path: our_models.sklearn.SklearnForecaster
     init_args:
-      individual: false
+      data_root_path: /home/gd25222/george/repos/timeseries_GAMs/ptsbenchmark/datasets
       use_lags: true
+      use_feat_idx_emb: false # In the sklearn pipeline there is no weight updating so if this is true it generates embeddings with the initial random weights.
+      use_time_feat: false
+      use_scaling: false       # ← Forecaster TemporalScaler, replicated in raw_data_transfrom
+      scaler: standard      # must match data.data_manager.init_args.scaler
   learning_rate: 0.001
   quantiles_num: 20
 data:
@@ -26,6 +31,6 @@ data:
       prediction_length: 96     # required for long-term datasets
       split_val: true
       scaler: standard # identity, standard, temporal
-  batch_size: 64
+  batch_size: 1
   test_batch_size: 64
-  num_workers: 8
+  num_workers: 1

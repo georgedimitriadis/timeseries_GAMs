@@ -45,6 +45,7 @@ class LinearForecaster(Forecaster):
     def forecast(self, batch_data, num_samples=None):
         inputs = self.get_inputs(batch_data, 'encode')
         forecasts = self(inputs).unsqueeze(1)
+
         return forecasts
 
     def loss(self, batch_data):

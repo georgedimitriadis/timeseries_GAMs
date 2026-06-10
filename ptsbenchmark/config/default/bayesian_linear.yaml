@@ -11,10 +11,14 @@ trainer:
   default_root_dir: ./results
 model:
   forecaster:
-    class_path: probts.model.forecaster.point_forecaster.LinearForecaster
+    class_path: our_models.bayesian_linear.BayesianLinearForecaster
     init_args:
       individual: false
       use_lags: true
+      kl_weight: 0.2
+      init_sigma: -3
+      n_train_batches: 100
+  num_samples: 100
   learning_rate: 0.001
   quantiles_num: 20
 data:
