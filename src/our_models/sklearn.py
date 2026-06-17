@@ -24,11 +24,14 @@ from typing import List, Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import importlib.util, inspect
+import os
+import pickle
+import sys
 
 from probts.model.forecaster import Forecaster
 from preprocessing.data_loading import ProbTSDatasetLoader   # the loader you wrote
 from preprocessing.becnhmark_raw_data_transform import raw_data_transform
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -53,16 +56,21 @@ class SklearnForecaster(Forecaster):
 
     def __init__(
             self,
-            sklearn_model,
             data_root_path: str,
             scaler: str,
+            sk_model_params: dict,
+            model_save_dir: str,
             **kwargs,
     ):
         super().__init__(**kwargs)
-        self.sklearn_model = sklearn_model
+        self.sk_model_params = sk_model_params
+        self.sklearn_model = self.initialise_model()
         self.data_root_path = data_root_path
         self._is_fitted = False
         self.scaler = scaler
+        self._sklearn_ckpt_path = os.path.join(
+            model_save_dir, f"sklearn_model_{type(self.sklearn_model).__name__}.pkl"  # or any per-experiment dir you have
+        )
 
         # history_length: how many raw steps are in past_target_cdf
         # mirrors DataManager._set_meta_parameters:
@@ -76,6 +84,32 @@ class SklearnForecaster(Forecaster):
         # Dummy parameter so Lightning can call loss.backward() cleanly
         # (zero gradient, no weight update)
         self._dummy_param = nn.Parameter(torch.zeros(1))
+
+    def initialise_model(self):
+        """
+        Loads the single class in the script as a scikit learn model. If there are more than one classes in the script then
+        the class to be imported needs to be the first otherwise this breaks.
+        :param module_name: The path to the script
+        :return: The model class
+        """
+        spec = importlib.util.spec_from_file_location("module_name", self.sk_model_params['sk_model_path'])
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["module_name"] = module
+        spec.loader.exec_module(module)
+
+        classes = [
+            obj for _, obj in inspect.getmembers(module, inspect.isclass)
+            if obj.__module__ == module.__name__
+        ]
+        self.sk_model_params['target_dim'] = self.target_dim
+        self.sk_model_params['context_length'] = self.context_length
+        self.sk_model_params['prediction_length'] = self.prediction_length
+        self.sk_model_params['freq'] = self.freq
+        self.sk_model_params['use_lags'] = self.use_lags
+        if self.use_lags:
+            self.sk_model_params['lags_list'] = self.lags_list
+
+        return classes[0](**self.sk_model_params)
 
     # ── Training ──────────────────────────────────────────────────────────────
 
@@ -133,6 +167,8 @@ class SklearnForecaster(Forecaster):
         y_list: List[np.ndarray] = []
 
         for arr in train_list:  # arr: [T, F]
+            print(f'Arr shape = {arr.shape}')
+            print(f'target_dim = {self.target_dim}')
             T = arr.shape[0]
             n_valid = T - self._history_length - self.max_prediction_length + 1
             if n_valid <= 0:
@@ -168,10 +204,23 @@ class SklearnForecaster(Forecaster):
         Always returns a zero-gradient dummy loss so Lightning's
         training step completes without error.
         """
+
         if not self._is_fitted:
+
+            batch_X = self.get_inputs(batch_data, 'encode')
+            batch_y = batch_data.future_target_cdf
             X, y = self._build_training_data()
+
+            np.savez('/home/gd25222/george/repos/timeseries_GAMs/src/data.npz', batch_X=batch_X, batch_y=batch_y, X=X, y=y)
+
             self.sklearn_model.fit(X, y)
             self._is_fitted = True
+
+            # Persist the fitted estimators so the test stage can reload them
+            # without refitting (refit is too expensive to repeat).
+            os.makedirs(os.path.dirname(self._sklearn_ckpt_path), exist_ok=True)
+            with open(self._sklearn_ckpt_path, "wb") as f:
+                pickle.dump(self.sklearn_model, f)
 
         # Zero-gradient loss — keeps Lightning happy without touching weights
         return self._dummy_param.sum() * 0.0
@@ -195,6 +244,17 @@ class SklearnForecaster(Forecaster):
         torch.Tensor  shape [B, 1, prediction_length, target_dim]
             The 1 in dim-1 signals a point forecast (no sample dimension).
         """
+        # If the benchmark hasn't loaded the model properly load it here
+        if not self.sklearn_model._fitted:
+            if not os.path.exists(self._sklearn_ckpt_path):
+                raise RuntimeError(
+                    f"No fitted sklearn model at {self._sklearn_ckpt_path}; "
+                    "run the fit stage before test."
+                )
+            print('Loading saved model for testing')
+            with open(self._sklearn_ckpt_path, "rb") as f:
+                self.sklearn_model = pickle.load(f)
+
         # TemporalScaler must be fitted before get_inputs() reads self.scaler.scale
         if self.use_scaling:
             self.get_scale(batch_data)
@@ -202,8 +262,22 @@ class SklearnForecaster(Forecaster):
         # [B, context_length, input_size]  — exactly what a linear layer sees
         inputs = self.get_inputs(batch_data, 'encode')
 
-        B = inputs.shape[0]
-        x_np = inputs.detach().cpu().numpy().reshape(B, -1)  # [B, ctx*in]
+        if self.use_lags:
+            # inputs: [B, ctx, C*n_lags], channel axis is lag-major/channel-minor
+            B = inputs.shape[0]
+            ctx = self.max_context_length
+            C = self.target_dim
+            n_lags = len(self.lags_list)
+
+            x = inputs.detach().cpu().numpy()
+            x = x.reshape(B, ctx, n_lags, C)  # split channel axis: lag, then channel
+            x = x.transpose(0, 2, 1, 3)  # [B, n_lags, ctx, C]  — lag now ahead of time
+            x = x.reshape(B, n_lags * ctx, C)  # stack lags along time
+            x_np = x.reshape(B, -1)  # flatten time*lags-major, C-minor
+        else:
+            B = inputs.shape[0]
+            x_np = inputs.detach().cpu().numpy().reshape(B, -1)  # [B, ctx*in]
+
         preds = self.sklearn_model.predict(x_np)             # [B, P*F]
 
         forecasts = (

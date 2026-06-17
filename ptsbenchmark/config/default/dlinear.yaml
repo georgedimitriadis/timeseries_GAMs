@@ -15,9 +15,9 @@ model:
     init_args:
       individual: false
       kernel_size: 3
-      use_lags: true
-      use_feat_idx_emb: true
-      use_time_feat: true
+      use_lags: false # default true
+      use_feat_idx_emb: false # default true
+      use_time_feat: false # default true
   learning_rate: 0.01
   quantiles_num: 20
 data:
@@ -27,6 +27,8 @@ data:
       dataset: solar_nips
       split_val: true
       scaler: standard # identity, standard, temporal
+      context_length: 96        # required for long-term datasets
+      prediction_length: 96     # required for long-term datasets
   batch_size: 32
   test_batch_size: 32
   num_workers: 8

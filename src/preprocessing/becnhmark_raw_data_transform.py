@@ -70,7 +70,7 @@ def raw_data_transform(
             end = -lag if lag > 0 else None
             lv = window[begin:end, :]  # [ctx, F]
             lagged.append(lv / scale if scale is not None else lv)
-        seq = np.concatenate(lagged, axis=-1)  # [ctx, F*n_lags]
+        seq = np.concatenate(lagged, axis=0)  # [ctx*n_lags, F]
     else:
         seq = window[-context_length:, :]  # [ctx, F]
         if scale is not None:

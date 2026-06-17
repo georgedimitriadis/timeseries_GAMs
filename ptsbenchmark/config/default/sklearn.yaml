@@ -1,12 +1,12 @@
 # lightning==2.3.0.dev0
-seed_everything: 1
+seed_everything: 3
 trainer:
   accelerator: cpu
   devices: 1
   strategy: auto
   max_epochs: 1
   use_distributed_sampler: false
-  limit_train_batches: 100
+  limit_train_batches: 1
   log_every_n_steps: 1
   default_root_dir: ./results
   num_sanity_val_steps: 0
@@ -15,11 +15,16 @@ model:
     class_path: our_models.sklearn.SklearnForecaster
     init_args:
       data_root_path: /home/gd25222/george/repos/timeseries_GAMs/ptsbenchmark/datasets
-      use_lags: true
+      use_lags: false
       use_feat_idx_emb: false # In the sklearn pipeline there is no weight updating so if this is true it generates embeddings with the initial random weights.
       use_time_feat: false
       use_scaling: false       # ← Forecaster TemporalScaler, replicated in raw_data_transfrom
       scaler: standard      # must match data.data_manager.init_args.scaler
+      model_save_dir: /home/gd25222/george/repos/timeseries_GAMs/src/sklearn_model_checkpoints  # That is required for the Forecaster to save the correct state of a scikit learn model
+      sk_model_params:
+        sk_model_path: /home/gd25222/george/repos/timeseries_GAMs/src/our_models/dlinear_ridge.py
+        kernel_size: 3 # Same as the kernel_size in dlinear.yaml
+        individual: true
   learning_rate: 0.001
   quantiles_num: 20
 data:
@@ -27,7 +32,7 @@ data:
     class_path: probts.data.data_manager.DataManager
     init_args:
       dataset: solar_nips
-      context_length: 96        # required for long-term datasets
+      context_length: 96        # required for long-term datasets. Also it cannot be a list because the code breaks!
       prediction_length: 96     # required for long-term datasets
       split_val: true
       scaler: standard # identity, standard, temporal
