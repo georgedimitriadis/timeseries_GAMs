@@ -99,7 +99,7 @@ def main():
     parser.add_argument("-d", "--data_dir", default='./talent_benchmark/data',
                         help="The folder of the datasets.")
     parser.add_argument("-l", "--results_model_dir", default='./talent_benchmark/results_model',
-                        help="The folder of the saved models.")
+                        help="The folder of the saved our_models.")
     parser.add_argument("-s", "--dataset", default='airfoil_self_noise',
                         help="The dataset to visualise.")
 

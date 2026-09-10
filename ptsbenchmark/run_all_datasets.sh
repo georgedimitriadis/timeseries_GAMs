@@ -1,0 +1,68 @@
+#!/bin/bash
+
+MODEL=$1
+
+if [ -z "$MODEL" ]; then
+    echo "Usage: $0 <model_name>"
+    echo "e.g., $0 dlinear"
+    exit 1
+fi
+
+DATA_DIR=./datasets
+LOG_DIR=./log_dir
+
+# Multivariate short-term datasets (configs under config/stsf)
+MULTIVARIATE_DATASETS=(
+    'exchange' 'solar' 'electricity' 'traffic' 'wiki'
+)
+
+# Univariate short-term datasets (configs under config/m4)
+#UNIVARIATE_DATASETS=(
+#    'm4_weekly' 'm4_daily' 'm5' 'tourism_monthly'
+#)
+
+# Long-term forecasting datasets (configs under config/ltsf)
+LONG_TERM_DATASETS=(
+    'etth1' 'etth2' 'ettm1' 'ettm2' 'traffic_ltsf' 'electricity_ltsf'
+    'exchange_ltsf' 'traffic_ltsf' 'weather_ltsf'
+)
+
+CTX_LEN=96
+PRED_LENS=(96 132 336 720)
+
+# Multivariate short-term: default lengths, config/stsf
+for DATASET in "${MULTIVARIATE_DATASETS[@]}"; do
+    echo "=== Running ${MODEL} on ${DATASET} (multivariate, default lengths) ==="
+    python run.py --config config/stsf/${DATASET}/${MODEL}.yaml --seed_everything 0  \
+            --data.data_manager.init_args.path ${DATA_DIR} \
+            --trainer.default_root_dir ${LOG_DIR} \
+            --data.data_manager.init_args.split_val true
+done
+
+# Univariate short-term: default lengths, config/m4
+#for DATASET in "${UNIVARIATE_DATASETS[@]}"; do
+#    echo "=== Running ${MODEL} on ${DATASET} (univariate, default lengths) ==="
+#    python run.py --config config/m4/${DATASET}/${MODEL}.yaml --seed_everything 0 \
+#        --data.data_manager.init_args.path ${DATA_DIR} \
+#        --trainer.default_root_dir ${LOG_DIR} \
+#        --data.data_manager.init_args.dataset ${DATASET} \
+#        --data.data_manager.init_args.split_val true \
+#        --trainer.max_epochs 50
+        # --trainer.accelerator=cpu --trainer.devices=1
+#done
+
+# Long-term: CTX_LEN=96, sweep PRED_LEN, config/ltsf
+for DATASET in "${LONG_TERM_DATASETS[@]}"; do
+    for PRED_LEN in "${PRED_LENS[@]}"; do
+        echo "=== Running ${MODEL} on ${DATASET} (ctx=${CTX_LEN}, pred=${PRED_LEN}) ==="
+        python run.py --config config/ltsf/${DATASET}/${MODEL}.yaml --seed_everything 0 \
+            --data.data_manager.init_args.path ${DATA_DIR} \
+            --trainer.default_root_dir ${LOG_DIR} \
+            --data.data_manager.init_args.dataset ${DATASET} \
+            --data.data_manager.init_args.split_val true \
+            --trainer.max_epochs 50 \
+            --data.data_manager.init_args.context_length ${CTX_LEN} \
+            --data.data_manager.init_args.prediction_length ${PRED_LEN}
+            # --trainer.accelerator=cpu --trainer.devices=1
+    done
+done

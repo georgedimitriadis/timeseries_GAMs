@@ -5,8 +5,6 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
-from TALENT.model.classical_methods.base import classical_methods
-from TALENT.model.lib.data import Dataset, get_dataset
 
 
 def normalise_data(data):
