@@ -23,7 +23,7 @@ PROBTS_REPO="${THIS_REPO}/ptsbenchmark"
 
 # --- experiment settings -----------------------------------------------------
 MODEL=dlinear_autoreg          # just used to pick the config file name below
-DATASET=electricity_ltsf
+DATASET=traffic_ltsf
 CTX_LEN=96
 PRED_LEN=720
 

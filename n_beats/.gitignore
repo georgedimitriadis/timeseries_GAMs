@@ -1,0 +1,11 @@
+.idea
+__pycache__
+venv
+*.pyc
+*.th
+.DS_Store
+*.png
+results/
+*egg-info*
+.tox
+m4/
