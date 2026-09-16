@@ -1,0 +1,337 @@
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+import numpy as np
+import pytest
+
+from darts import TimeSeries
+from darts.dataprocessing.transformers import BaseDataTransformer
+from darts.utils.timeseries_generation import constant_timeseries
+
+
+class TestBaseDataTransformer:
+    class DataTransformerMock(BaseDataTransformer):
+        def __init__(
+            self,
+            scale: float,
+            translation: float,
+            stack_samples: bool = False,
+            mask_components: bool = True,
+            parallel_params: bool | Sequence[str] = False,
+            columns: str | list[str] | None = None,
+        ):
+            """
+            Applies the transform `transformed_series = scale * series + translation`.
+
+            Parameters
+            ----------
+            scale
+                Scale coefficient of transform.
+            translation
+                Translational constant of transform.
+            stack_samples
+                Whether to call `stack_samples` inside of `ts_transform`.
+            mask_components
+                Whether to automatically apply any provided `component_mask` key word arguments. See
+                `BaseDataTransformer` docstring for further details.
+            parallel_params
+                Specifies which parameters should vary between different parallel jobs, supposing that
+                multiple time series are given to `ts_transform`. See `BaseDataTransformer` docstring
+                for further details.
+
+            """
+            self._scale = scale
+            self._translation = translation
+            self._stack_samples = stack_samples
+            self._mask_components = mask_components
+            super().__init__(
+                name="DataTransformerMock",
+                mask_components=mask_components,
+                columns=columns,
+                parallel_params=parallel_params,
+            )
+
+        @staticmethod
+        def ts_transform(
+            series: TimeSeries, params: Mapping[str, Any], **kwargs
+        ) -> TimeSeries:
+            """
+            Implements the transform `scale * series + translation`.
+
+            If `component_mask` is in `kwargs`, this is manually applied and unapplied. If
+            `_stack_samples = True` in `params['fixed']`, then `stack_samples` and `unstack_samples`
+            all used when computing this transformation.
+
+            """
+            fixed_params = params["fixed"]
+            stack_samples = fixed_params["_stack_samples"]
+            mask_components = fixed_params["_mask_components"]
+            scale, translation = fixed_params["_scale"], fixed_params["_translation"]
+
+            # Ensure `component_mask` not passed via `kwargs` if specified `mask_components=True`
+            # when transform created
+            if mask_components:
+                assert "component_mask" not in kwargs
+
+            # Ensure manual masking only performed when `mask_components = False`
+            # when transform constructed:
+            if not mask_components and ("component_mask" in kwargs):
+                vals = TestBaseDataTransformer.DataTransformerMock.apply_component_mask(
+                    series, kwargs["component_mask"], return_ts=False
+                )
+            else:
+                vals = series.all_values()
+
+            if stack_samples:
+                vals = TestBaseDataTransformer.DataTransformerMock.stack_samples(vals)
+            vals = scale * vals + translation
+            if stack_samples:
+                vals = TestBaseDataTransformer.DataTransformerMock.unstack_samples(
+                    vals, series=series
+                )
+
+            if not mask_components and ("component_mask" in kwargs):
+                vals = (
+                    TestBaseDataTransformer.DataTransformerMock.unapply_component_mask(
+                        series, vals, kwargs["component_mask"]
+                    )
+                )
+
+            return series.with_values(vals)
+
+    @pytest.mark.parametrize("component_mask", [None, np.array([True])])
+    def test_input_transformed_single_series(self, component_mask):
+        """
+        Tests for correct transformation of single series.
+        """
+        test_input = constant_timeseries(value=1, length=10)
+        test_input_copy = test_input.copy()
+
+        mock = self.DataTransformerMock(scale=2, translation=10)
+
+        transformed = mock.transform(test_input, component_mask=component_mask)
+
+        # 2 * 1 + 10 = 12
+        expected = constant_timeseries(value=12, length=10)
+        assert transformed == expected
+        assert test_input == test_input_copy
+
+    @pytest.mark.parametrize("col_names", ["A", None, ["A"], ["B"], ["A", "B"]])
+    def test_columns_subset(self, col_names):
+        """
+        Tests if the `columns` argument correctly applies the transform only to the specified columns.
+        """
+        ts_a = constant_timeseries(value=1, length=10, column_name="A")
+        ts_b = constant_timeseries(value=2, length=10, column_name="B")
+
+        test_input = ts_a.stack(ts_b)
+        test_input_copy = test_input.copy()
+
+        mock = self.DataTransformerMock(scale=2, translation=10, columns=col_names)
+
+        transformed = mock.transform(test_input)
+
+        if col_names is None or "A" in col_names:
+            assert transformed["A"] == constant_timeseries(
+                value=12, length=10, column_name="A"
+            )
+        else:
+            assert transformed["A"] == constant_timeseries(
+                value=1, length=10, column_name="A"
+            )
+
+        if col_names is None or "B" in col_names:
+            assert transformed["B"] == constant_timeseries(
+                value=14, length=10, column_name="B"
+            )
+        else:
+            assert transformed["B"] == constant_timeseries(
+                value=2, length=10, column_name="B"
+            )
+
+        assert test_input == test_input_copy
+
+    def test_generate_component_mask(self):
+        """
+        Test if all behaviours of `_generate_component_mask` are correct.
+        That includes raising errors when both `component_mask` and `columns` are provided,
+        when `columns` is `None` the result should be the provided `component_mask`,
+        when a specified column is not in the series, and a valid configuration of `columns` and `component_mask`
+        """
+        ts_a = constant_timeseries(value=1, length=10, column_name="A")
+        ts_b = constant_timeseries(value=2, length=10, column_name="B")
+        ts = ts_a.stack(ts_b)
+
+        # When both `component_mask` and `columns` are provided
+        mock = self.DataTransformerMock(scale=2, translation=10, columns=["A"])
+        with pytest.raises(ValueError) as exc_info:
+            mock.transform(
+                series=ts,
+                component_mask=np.array([True, False]),
+            )
+        assert "Cannot pass `columns` and `component_mask`" in str(exc_info.value)
+
+        # When a specified column is not in the series a `ValueError` should be thrown
+        mock = self.DataTransformerMock(scale=2, translation=10, columns=["A", "C"])
+        with pytest.raises(ValueError) as exc_info:
+            mock.transform(series=ts)
+        assert "do not exist in the `TimeSeries` components" in str(exc_info.value)
+
+        # When `columns` is `None` the result should be the provided `component_mask`
+        dummy_mask = np.array([False, True])
+        result = BaseDataTransformer._generate_component_mask(
+            series=ts, component_mask=dummy_mask, columns=None
+        )
+        np.testing.assert_array_equal(result, dummy_mask)
+
+        # Valid configuration of `columns` and `component_mask`
+        res_happy = BaseDataTransformer._generate_component_mask(
+            series=ts, component_mask=None, columns=["B"]
+        )
+        np.testing.assert_array_equal(res_happy, np.array([False, True]))
+
+    def test_input_transformed_multiple_series(self):
+        """
+        Tests for correct transformation of multiple series when
+        different param values are used for different parallel
+        jobs (i.e. test that `parallel_params` argument is treated
+        correctly). Also tests that transformer correctly handles
+        being provided with fewer input series than fixed parameter
+        value sets.
+        """
+        test_input_1 = constant_timeseries(value=1, length=10)
+        test_input_2 = constant_timeseries(value=2, length=11)
+
+        # Don't have different params for different jobs:
+        mock = self.DataTransformerMock(scale=2, translation=10, parallel_params=False)
+        (transformed_1, transformed_2) = mock.transform((test_input_1, test_input_2))
+        # 2 * 1 + 10 = 12
+        assert transformed_1 == constant_timeseries(value=12, length=10)
+        # 2 * 2 + 10 = 14
+        assert transformed_2 == constant_timeseries(value=14, length=11)
+
+        # Have different `scale` param for different jobs:
+        mock = self.DataTransformerMock(
+            scale=(2, 3), translation=10, parallel_params=["_scale"]
+        )
+        (transformed_1, transformed_2) = mock.transform((test_input_1, test_input_2))
+        # 2 * 1 + 10 = 12
+        assert transformed_1 == constant_timeseries(value=12, length=10)
+        # 3 * 2 + 10 = 16
+        assert transformed_2 == constant_timeseries(value=16, length=11)
+
+        # If only one timeseries provided, should apply parameters defined for
+        # for the first to that series:
+        transformed_1 = mock.transform(test_input_1)
+        assert transformed_1 == constant_timeseries(value=12, length=10)
+
+        # Have different `scale`, `translation`, and `stack_samples` params for different jobs:
+        mock = self.DataTransformerMock(
+            scale=(2, 3),
+            translation=(10, 11),
+            stack_samples=(False, True),
+            mask_components=(False, False),
+            parallel_params=True,
+        )
+        (transformed_1, transformed_2) = mock.transform((test_input_1, test_input_2))
+        # 2 * 1 + 10 = 12
+        assert transformed_1 == constant_timeseries(value=12, length=10)
+        # 3 * 2 + 11 = 17
+        assert transformed_2 == constant_timeseries(value=17, length=11)
+
+        # If only one timeseries provided, should apply parameters defined for
+        # for the first to that series:
+        transformed_1 = mock.transform(test_input_1)
+        assert transformed_1 == constant_timeseries(value=12, length=10)
+
+        # Specify three sets of fixed params, but pass only one or two series as inputs
+        # to `transform`; transformer should apply `i`th set of fixed params to the `i`th
+        # input passed to `transform`
+        mock = self.DataTransformerMock(
+            scale=(2, 3, 4),
+            translation=(10, 11, 12),
+            stack_samples=(False, True, False),
+            mask_components=(False, False, False),
+            parallel_params=True,
+        )
+        # If single series provided to transformer with three sets of
+        # fixed params, should transform using the first set of fixed
+        # parameters:
+        transformed_1 = mock.transform(test_input_1)
+        assert transformed_1 == constant_timeseries(value=12, length=10)
+        # If two series provided to transformer with three sets of
+        # fixed params, should transform using the first and second set of fixed
+        # parameters:
+        transformed_1, transformed_2 = mock.transform((test_input_1, test_input_2))
+        assert transformed_1 == constant_timeseries(value=12, length=10)
+        assert transformed_2 == constant_timeseries(value=17, length=11)
+
+    def test_input_transformed_multiple_samples(self):
+        """
+        Tests that `stack_samples` and `unstack_samples` correctly
+        implemented when considering multi-sample timeseries.
+        """
+        test_input = constant_timeseries(value=1, length=10)
+        test_input = test_input.concatenate(
+            constant_timeseries(value=2, length=10), axis="sample"
+        )
+
+        mock = self.DataTransformerMock(scale=2, translation=10, stack_samples=True)
+        transformed = mock.transform(test_input)
+
+        # 2 * 1 + 10 = 12
+        expected = constant_timeseries(value=12, length=10)
+        # 2 * 2 + 10 = 14
+        expected = expected.concatenate(
+            constant_timeseries(value=14, length=10), axis="sample"
+        )
+        assert transformed == expected
+
+    def test_input_transformed_masking(self):
+        """
+        Tests that automatic component masking is correctly implemented,
+        and that manual component masking is also handled correctly
+        through `kwargs` + `apply_component_mask`/`unapply_component_mask`
+        methods.
+        """
+        test_input = TimeSeries.from_values(np.ones((4, 3, 5)))
+        mask = np.array([True, False, True])
+        # Second component should be untransformed:
+        scale = 2
+        translation = 10
+        expected = np.stack(
+            [12 * np.ones((4, 5)), np.ones((4, 5)), 12 * np.ones((4, 5))], axis=1
+        )
+        expected = TimeSeries.from_values(expected)
+
+        # Automatically apply component mask:
+        mock = self.DataTransformerMock(
+            scale=scale, translation=translation, mask_components=True
+        )
+        transformed = mock.transform(test_input, component_mask=mask)
+        assert transformed == expected
+
+        # Manually apply component mask:
+        mock = self.DataTransformerMock(scale=2, translation=10, mask_components=False)
+        transformed = mock.transform(test_input, component_mask=mask)
+        assert transformed == expected
+
+
+class TestBaseDataTransformerInputValidation:
+    def _make_transformer(self):
+        class _Mock(BaseDataTransformer):
+            @staticmethod
+            def ts_transform(series, params, **kwargs):
+                return series
+
+        return _Mock()
+
+    def test_set_verbose_non_bool(self):
+        transformer = self._make_transformer()
+        with pytest.raises(ValueError, match="Verbosity status must be a boolean"):
+            transformer.set_verbose("True")
+
+    def test_set_n_jobs_non_int(self):
+        transformer = self._make_transformer()
+        with pytest.raises(ValueError, match="n_jobs must be an integer"):
+            transformer.set_n_jobs(1.5)

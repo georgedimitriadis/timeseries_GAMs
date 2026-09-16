@@ -1,0 +1,493 @@
+import itertools
+from collections.abc import Sequence
+from copy import deepcopy
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from darts import TimeSeries
+from darts import concatenate as darts_concat
+from darts.dataprocessing.transformers import Diff
+from darts.utils.timeseries_generation import linear_timeseries, sine_timeseries
+
+
+class TestDiff:
+    sine_series = [
+        5 * sine_timeseries(length=50, value_frequency=f) for f in (0.05, 0.1, 0.15)
+    ]
+    sine_series = darts_concat(
+        sine_series,
+        axis=1,
+    )
+
+    def assert_series_equal(
+        self,
+        series1: TimeSeries,
+        series2: TimeSeries,
+        equal_nan: bool,
+        to_compare: np.ndarray | None = None,
+    ):
+        """
+        Helper to compare series differenced by `Diff`.
+
+        Parameters
+        ----------
+            series1
+                First `TimeSeries` object to compare.
+            series2
+                Second `TimeSeries` object to compare.
+            equal_nan
+                Whether to compare `NaN` values as equal (see `help(np.testing.assert_allclose)`); should set
+                `equal_nan=(not dropna)` (i.e. should throw error if there are `NaN` values when user has requested
+                for them to be dropped).
+            to_compare
+                boolean `np.ndarray` which specifies which subset of columns should be compared in `series1` and
+                `series2`. Used when checking that components not specified by `component_mask` have NOT been
+                differenced after `fit`ing (i.e. `to_compare = ~component_mask`). If `to_compare = None`, all
+                columns in `series1` and `series2` are compared.
+        """
+        if to_compare is not None:
+            series1 = series1.drop_columns(series1.columns[~to_compare])
+            series2 = series2.drop_columns(series2.columns[~to_compare])
+        np.testing.assert_allclose(
+            series1.all_values(), series2.all_values(), atol=1e-8, equal_nan=equal_nan
+        )
+        assert series1.time_index.equals(series2.time_index)
+
+    def test_diff_quad_series(self):
+        """
+        Tests that differencing a quadratic series (computed by `cumsum`ing a linear series)
+        yields the original linear series.
+        """
+        lin_series = linear_timeseries(start_value=1, end_value=10, length=50)
+        quad_series = TimeSeries(
+            times=lin_series.time_index,
+            values=lin_series.all_values().cumsum(axis=0),
+            components=lin_series.components,
+        )
+        for dropna in (False, True):
+            diff = Diff(lags=1, dropna=dropna)
+            diff.fit(quad_series)
+            # Differencing causes first point to be 'dropped':
+            transformed_series = diff.transform(quad_series)
+            expected_transform = lin_series.drop_before(0)
+            if not dropna:
+                expected_transform = expected_transform.prepend_values([np.nan])
+            self.assert_series_equal(
+                expected_transform, transformed_series, equal_nan=(not dropna)
+            )
+            self.assert_series_equal(
+                series1=quad_series,
+                series2=diff.inverse_transform(transformed_series),
+                equal_nan=(not dropna),
+            )
+
+    def test_diff_inverse_transform_beyond_fit_data(self):
+        """
+        Tests that `Diff` class can 'undifference' data that extends beyond
+         what was used to fit it (e.g. like when undifferencing a forecast of
+         a differenced timeseries, so as to yield a forecast of the undifferenced
+         time series)
+        """
+
+        # (`lag`, `dropna`) pairs:
+        test_cases = [
+            (1, True),
+            (1, False),
+            ([1, 2, 3, 2, 1], True),
+            ([1, 2, 3, 2, 1], False),
+        ]
+
+        # Artifically truncate series:
+        short_sine = self.sine_series.copy().drop_after(10)
+        short_sine_copy = short_sine.copy()
+        for lags, dropna in test_cases:
+            # Fit Diff to truncated series:
+            diff = Diff(lags=lags, dropna=dropna)
+            diff.fit(short_sine)
+            assert short_sine == short_sine_copy
+
+            # Difference entire time series:
+            to_undiff = self.sine_series.copy()
+            if not isinstance(lags, Sequence):
+                lags = (lags,)
+            for lag in lags:
+                to_undiff = to_undiff.diff(n=1, periods=lag, dropna=dropna)
+
+            to_undiff_copy = to_undiff
+            # Should be able to undifference entire series even though only fitted
+            # to truncated series:
+            self.assert_series_equal(
+                series1=self.sine_series,
+                series2=diff.inverse_transform(to_undiff),
+                equal_nan=(not dropna),
+            )
+            assert to_undiff == to_undiff_copy
+
+    def test_diff_multi_ts(self):
+        """
+        Tests that `Diff` correctly behaves when given multiple time series, both when a `component_mask`
+        is provided and when one is not.
+        """
+
+        # (`lags`, `dropna`, `component_mask`) triplets; note that combination of `dropna = True``
+        # AND `component_mask is not None` is not tested here, since this should throw error
+        # (see `test_diff_dropna_and_component_mask_specified`):
+        component_mask = np.array([True, False, True])
+        test_cases = [
+            (1, True, None),
+            (1, False, None),
+            ([1, 2, 3, 2, 1], True, None),
+            ([1, 2, 3, 2, 1], False, None),
+            (1, False, component_mask),
+            ([1, 2, 3, 2, 1], False, component_mask),
+        ]
+        for lags, dropna, mask in test_cases:
+            diff = Diff(lags=lags, dropna=dropna)
+            transformed = diff.fit_transform(
+                [self.sine_series, self.sine_series], component_mask=mask
+            )
+            if mask is not None:
+                # Masked components should be undifferenced:
+                self.assert_series_equal(
+                    self.sine_series,
+                    transformed[0],
+                    equal_nan=(not dropna),
+                    to_compare=~mask,
+                )
+                self.assert_series_equal(
+                    self.sine_series,
+                    transformed[1],
+                    equal_nan=(not dropna),
+                    to_compare=~mask,
+                )
+            # Should recover original sine_series:
+            back = diff.inverse_transform(transformed, component_mask=mask)
+            self.assert_series_equal(self.sine_series, back[0], equal_nan=(not dropna))
+            self.assert_series_equal(self.sine_series, back[1], equal_nan=(not dropna))
+
+    @pytest.mark.parametrize("component_mask", [None, np.array([True] * 5)])
+    def test_diff_stochastic_series(self, component_mask):
+        """
+        Tests that `Diff` class correctly differences and then undifferences a
+        random series with multiple samples.
+        """
+        test_cases = [
+            (1, True),
+            (1, False),
+            ([1, 2, 3, 2, 1], True),
+            ([1, 2, 3, 2, 1], False),
+        ]
+
+        vals = np.random.rand(10, 5, 10)
+        series = TimeSeries.from_values(vals)
+        series_copy = series.copy()
+
+        for lags, dropna in test_cases:
+            component_mask = component_mask if not dropna else None
+            transformer = Diff(lags=lags, dropna=dropna)
+            new_series = transformer.fit_transform(
+                series, component_mask=component_mask
+            )
+            assert series == series_copy
+
+            new_series_copy = new_series.copy()
+            series_back = transformer.inverse_transform(
+                new_series, component_mask=component_mask
+            )
+
+            # Should recover original series:
+            self.assert_series_equal(series, series_back, equal_nan=(not dropna))
+            assert new_series == new_series_copy
+
+    @pytest.mark.parametrize(
+        "config",
+        itertools.product(
+            [True, False],
+            [True, False],
+            [[1], [1, 2]],
+        ),
+    )
+    def test_diff_with_component_mask_or_columns(self, config):
+        """
+        Tests that `Diff` works with columns or component masks in combination with other parameters.
+        """
+        dropna, mask_components, lags = config
+
+        mask = np.array([1, 0, 1], dtype=bool)
+
+        kwargs = (
+            dict(columns=self.sine_series.columns[mask])
+            if not mask_components
+            else dict()
+        )
+        tf_kwargs = dict(component_mask=mask) if mask_components else dict()
+        diff = Diff(lags=lags, dropna=dropna, **kwargs)
+
+        series_tf = diff.fit_transform(self.sine_series, **tf_kwargs)
+
+        vals_orig, vals_tf = self.sine_series.values(), series_tf.values()
+        vals_tf_slice = slice(None) if dropna else slice(sum(lags), None)
+
+        # non-transformed columns must be equal
+        np.testing.assert_array_almost_equal(
+            vals_tf[vals_tf_slice, ~mask], vals_orig[sum(lags) :, ~mask]
+        )
+
+        # transformed columns must be diffed
+        vals_expected = vals_orig.copy()[:, mask]
+        for idx, lag in enumerate(lags):
+            vals_expected = vals_expected[lag:] - vals_expected[:-lag]
+        np.testing.assert_array_almost_equal(
+            vals_tf[vals_tf_slice, mask], vals_expected
+        )
+
+        # inverse transformed must be equal to original values
+        series_inv_tf = diff.inverse_transform(series_tf, **tf_kwargs)
+        np.testing.assert_array_almost_equal(series_inv_tf.values(), vals_orig)
+
+    def test_diff_series_too_short(self):
+        """
+        Tests that `Diff` throws error is length of series is less than `sum(lags)` (i.e.
+        there's not enough data to fit the differencer)
+        """
+        lags = (1000,)
+        diff = Diff(lags=lags)
+        with pytest.raises(ValueError) as e:
+            diff.fit(self.sine_series)
+        assert (
+            f"Series requires at least {sum(lags) + 1} timesteps "
+            f"to difference with lags {lags}; series only "
+            f"has {self.sine_series.n_timesteps} timesteps."
+        ) == str(e.value)
+
+    @pytest.mark.parametrize(
+        "lags,dropna",
+        [
+            (1, True),
+            (1, False),
+            ([1, 12], True),
+            ([1, 12], False),
+        ],
+    )
+    def test_diff_inverse_transform_with_insample(self, lags, dropna):
+        """
+        Tests that ``inverse_transform(..., insample=...)`` matches prepending the transformed
+        insample to the forecast in diff space, then slicing the inverse result.
+        """
+        n_forecast = 10
+
+        diff = Diff(lags=lags, dropna=dropna)
+        series_tf = diff.fit_transform(self.sine_series)
+
+        insample_tf = series_tf[:-n_forecast]
+        forecast_tf = series_tf[-n_forecast:]
+        expected = self.sine_series[-n_forecast:]
+
+        result_full_series = diff.inverse_transform(series_tf)[-n_forecast:]
+        result_insample = diff.inverse_transform(forecast_tf, insample=insample_tf)
+
+        self.assert_series_equal(expected, result_insample, equal_nan=(not dropna))
+        self.assert_series_equal(expected, result_full_series, equal_nan=(not dropna))
+
+    def test_diff_inverse_transform_insample_extends_beyond_fit(self):
+        """
+        Tests ``insample`` that extends beyond the fitted range still inverse-transforms
+        the forecast correctly (trim-before-append logic).
+        """
+        n_forecast = 5
+        short_sine = self.sine_series.copy().drop_after(10)
+
+        diff = Diff(lags=1, dropna=True)
+        diff.fit(short_sine)
+        full_tf = diff.transform(self.sine_series)
+
+        # insample end intersects with `series`
+        insample_tf = full_tf[: -(n_forecast - 1)]
+        forecast_tf = full_tf[-n_forecast:]
+
+        expected = self.sine_series[-n_forecast:]
+        result = diff.inverse_transform(forecast_tf, insample=insample_tf)
+        self.assert_series_equal(expected, result, equal_nan=True)
+
+    def test_diff_inverse_transform_insample_errors(self):
+        """
+        Tests validation errors for invalid ``insample`` (start time, length, frequency).
+        """
+        diff = Diff(lags=1, dropna=True)
+        vals = np.random.rand(20, 2)
+        times = pd.date_range(start="2018-01-01", freq="D", periods=20)
+        series = TimeSeries.from_times_and_values(times, vals)
+        series_tf = diff.fit_transform(series)
+        forecast_tf = series_tf[-5:]
+        insample_ok = series_tf[:-5]
+
+        with pytest.raises(ValueError) as e:
+            diff.inverse_transform(forecast_tf, insample=forecast_tf)
+        assert "`insample` must start before the `series` start time." in str(e.value)
+        "`insample` must start before the `series` start time."
+
+        with pytest.raises(ValueError) as e:
+            diff.inverse_transform(forecast_tf, insample=insample_ok[1:])
+        assert "Expected the `insample` series to begin at time" in str(e.value)
+
+        with pytest.raises(ValueError) as e:
+            diff.inverse_transform(forecast_tf, insample=insample_ok[:-1])
+        assert "extend at least until one time step before" in str(e.value)
+
+        with pytest.raises(ValueError) as e:
+            diff.inverse_transform(forecast_tf, insample=[insample_ok, insample_ok])
+        assert "`insample` must have the same number of TimeSeries as `series`" in str(
+            e.value
+        )
+
+        insample_bad_freq = TimeSeries.from_times_and_values(
+            values=insample_ok.all_values(copy=False),
+            times=pd.date_range(
+                start=insample_ok.start_time(), freq="W", periods=len(insample_ok)
+            ),
+        )
+        with pytest.raises(ValueError) as e:
+            diff.inverse_transform(forecast_tf, insample=insample_bad_freq)
+        assert "`insample` is of frequency" in str(e.value)
+
+    @pytest.mark.parametrize("dropna", [False, True])
+    def test_diff_inverse_transform_with_insample_nested_sequence(self, dropna):
+        """
+        ``inverse_transform(..., insample=...)`` with nested ``Sequence[Sequence[TimeSeries]]``:
+        two outer groups (fit on two series) and multiple inner forecast chunks.
+        """
+        s1, s2 = self.sine_series, self.sine_series / 10.0
+        diff_n = Diff(lags=1, dropna=dropna)
+        tf = diff_n.fit_transform([s1, s2])
+
+        fc1, fc2 = tf[0][-14:-6], tf[0][-6:]
+        fc3 = tf[1][-7:]
+
+        insample = tf
+        fc_nested = [[fc1, fc2], [fc3]]
+
+        result_insample = diff_n.inverse_transform(fc_nested, insample=insample)
+        # Manual baselines: ``fc1`` lies inside ``tf[0][:-6]``, so use a shorter prefix for ``fc1`` only.
+        for i, j, fc, expected_ij, ins_m in (
+            (0, 0, fc1, s1[-14:-6], tf[0][:-14]),
+            (0, 1, fc2, s1[-6:], tf[0][:-6]),
+            (1, 0, fc3, s2[-7:], tf[1][:-7]),
+        ):
+            result_insample_ij = diff_n.inverse_transform(
+                fc, insample=ins_m, series_idx=i
+            )
+            self.assert_series_equal(
+                expected_ij, result_insample_ij, equal_nan=(not dropna)
+            )
+            self.assert_series_equal(
+                expected_ij, result_insample[i][j], equal_nan=(not dropna)
+            )
+
+    def test_diff_incompatible_inverse_transform_date(self):
+        """
+        Tests that `Diff` throws error when given series to `inverse_transform`
+        which starts at a date not equal to the first data of the fitting data.
+        """
+        vals = np.random.rand(10, 5)
+        series1 = TimeSeries.from_times_and_values(
+            values=vals, times=pd.date_range(start="1/1/2018", freq="d", periods=10)
+        )
+        series2 = TimeSeries.from_times_and_values(
+            values=vals, times=pd.date_range(start="1/2/2018", freq="d", periods=10)
+        )
+        for dropna in (False, True):
+            diff = Diff(lags=1, dropna=dropna)
+            diff.fit(series1)
+            series2_diffed = series2.diff(n=1, periods=1, dropna=dropna)
+            with pytest.raises(ValueError) as e:
+                diff.inverse_transform(series2_diffed)
+            expected_start = (
+                series1.start_time()
+                if (not dropna)
+                else series1.start_time() + series1.freq
+            )
+            assert (
+                f"Expected the `series` to begin at time {expected_start}; "
+                f"instead, it begins at time {series2_diffed.start_time()}."
+            ) == str(e.value)
+
+    def test_diff_incompatible_inverse_transform_freq(self):
+        """
+        Tests that `Diff` throws error when given series to `inverse_transform`
+        that has different frequency than fitting data.
+        """
+        vals = np.random.rand(10, 5)
+        series1 = TimeSeries.from_times_and_values(
+            values=vals, times=pd.date_range(start="1/1/2018", freq="W", periods=10)
+        )
+        series2 = TimeSeries.from_times_and_values(
+            values=vals,
+            times=pd.date_range(start="1/1/2018", freq="ME", periods=10),
+        )
+        diff = Diff(lags=1, dropna=True)
+        diff.fit(series1)
+        with pytest.raises(ValueError) as e:
+            diff.inverse_transform(series2.diff(n=1, periods=1, dropna=True))
+        assert (
+            f"Series is of frequency {series2.freq}, but transform was fitted to data of frequency {series1.freq}."
+            == str(e.value)
+        )
+
+    def test_diff_incompatible_inverse_transform_shape(self):
+        """
+        Tests that `Diff` throws error when given series to `inverse_transform`
+        that has different number of components or samples than the fitting data.
+        """
+        vals = np.random.rand(10, 5, 5)
+        dates = pd.date_range(start="1/1/2018", freq="W", periods=10)
+        series = TimeSeries.from_times_and_values(values=vals, times=dates)
+        diff = Diff(lags=1, dropna=True)
+        diff.fit(series)
+        series_rm_comp = TimeSeries.from_times_and_values(
+            values=vals[:, 1:, :], times=dates
+        )
+        with pytest.raises(ValueError) as e:
+            diff.inverse_transform(series_rm_comp.diff(n=1, periods=1, dropna=True))
+        assert (
+            f"Expected series to have {series.n_components} components; "
+            f"instead, it has {series.n_components - 1}." == str(e.value)
+        )
+        series_rm_samp = TimeSeries.from_times_and_values(
+            values=vals[:, :, 1:], times=dates
+        )
+        with pytest.raises(ValueError) as e:
+            diff.inverse_transform(series_rm_samp.diff(n=1, periods=1, dropna=True))
+        assert (
+            f"Expected series to have {series.n_samples} samples; "
+            f"instead, it has {series.n_samples - 1}." == str(e.value)
+        )
+
+    def test_diff_multiple_calls_to_fit(self):
+        """
+        Tests that `Diff` updates `start_vals` parameter when refitted to new data.
+        """
+        diff = Diff(lags=[2, 2], dropna=True)
+
+        diff.fit(self.sine_series)
+        startvals1 = deepcopy(diff._fitted_params)[0][0]
+
+        diff.fit(self.sine_series + 1)
+        startvals2 = deepcopy(diff._fitted_params)[0][0]
+
+        assert not np.allclose(startvals1, startvals2)
+
+    @pytest.mark.parametrize(
+        "dt_source",
+        ["float32", "float64"],
+    )
+    def test_dtype_conversion(self, dt_source):
+        series = self.sine_series.astype(dt_source)
+
+        transformer = Diff().fit(series)
+        transformed = transformer.transform(series)
+        inversed = transformer.inverse_transform(transformed)
+
+        assert transformed.dtype == dt_source
+        assert inversed.dtype == dt_source
