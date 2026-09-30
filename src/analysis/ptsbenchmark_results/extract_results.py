@@ -3,7 +3,7 @@ import pandas as pd
 import os
 
 dir = 'src/exps/2026_09_probTS_alldata_dlinear_multistep_reproduction'
-dir = 'ptsbenchmark/log_dir'
+#dir = 'ptsbenchmark/log_dir'
 ltsf_datasets = ['etth1', 'etth2', 'ettm1', 'ettm2', 'traffic_ltsf', 'electricity_ltsf',
     'exchange_ltsf', 'weather_ltsf']
 stsf_datasets=(
@@ -11,7 +11,7 @@ stsf_datasets=(
 )
 
 all_datasets = os.listdir(dir)
-pred_len = [96, 132, 336, 720]
+pred_len = [96, 192, 336, 720]
 index = pd.MultiIndex.from_tuples([(i, k) for i in ['NMAE', 'CRPS'] for k in pred_len], names=['Metric', 'Horizon'])
 ltsf_results = pd.DataFrame(columns=ltsf_datasets, index=index)
 stsf_results = pd.DataFrame(columns=stsf_datasets, index=pd.Index(['NMAE', 'CRPS'], name='Metric'))
@@ -41,7 +41,7 @@ for dataset in all_datasets:
             stsf_results.loc['CRPS', ds] = results['test_ND'][0]
     except:
         pass
-ltsf_results = ltsf_results.rename(index={132: 192}, level='Horizon')
+#ltsf_results = ltsf_results.rename(index={132: 192}, level='Horizon')
 paper_ltsf_results = pd.read_csv(os.path.join(dir, 'paper_dlinear_long_term.csv')).set_index(['Metric', 'Horizon'])
 paper_stsf_results = pd.read_csv(os.path.join(dir, 'paper_dlinear_short_term.csv')).set_index(['Metric'])
 

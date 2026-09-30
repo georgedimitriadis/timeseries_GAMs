@@ -31,7 +31,7 @@ DATA_DIR=./datasets
 LOG_DIR=./log_dir
 
 # Our config lives in THIS repo, not in the benchmark repo.
-CONFIG="${THIS_REPO}/src/configs/${MODEL}.yaml"
+CONFIG="${THIS_REPO}/src/configs/${DATASET}/${MODEL}.yaml"
 # ----------------------------------------------------------------------------
 
 # Make both packages importable. Prepend so our code wins on any name clash.
