@@ -7,7 +7,6 @@ if [ -z "$MODEL" ]; then
     echo "e.g., $0 dlinear"
     exit 1
 fi
-MODEL=dlinear_autoreg
 
 # --- paths you set once ------------------------------------------------------
 # Root of THIS repo (the folder that contains `src/`). Resolved automatically

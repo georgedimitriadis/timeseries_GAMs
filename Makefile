@@ -21,12 +21,10 @@ run_one_pts_dataset_many_cpu:
 		--trainer.default_root_dir ./src/exps/$(MODEL)
 
 run_all_pts_datasets_dlinear_multistep:
-	export CUDA_VISIBLE_DEVICES=0
-	./run_probts_all_datasets.sh dlinear
+	export CUDA_VISIBLE_DEVICES=0 ./run_probts_all_datasets.sh dlinear
 
 run_all_pts_datasets_dlinear_autoreg:
-	export CUDA_VISIBLE_DEVICES=0
-	./run_probts_all_datasets.sh CUDA_VISIBLE_DEVICES=1 dlinear_autoreg
+	export CUDA_VISIBLE_DEVICES=0 ./run_probts_all_datasets.sh dlinear_autoreg
 
 run_nbeats_on_dysts_data_for_paper_lorenz:
 	export CUDA_VISIBLE_DEVICES=0 python run_nbeats_on_dysts_data_for_paper.py --systems Lorenz --compare

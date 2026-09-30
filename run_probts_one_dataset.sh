@@ -19,11 +19,13 @@ THIS_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Absolute path to the cloned ProbTS benchmark repo (the folder that CONTAINS
 # the `probts/` package directory and `run.py`).
 PROBTS_REPO="${THIS_REPO}/ptsbenchmark"
+
 # ----------------------------------------------------------------------------
 
 # --- experiment settings -----------------------------------------------------
 MODEL=dlinear_autoreg          # just used to pick the config file name below
 DATASET=traffic_ltsf
+CONFIG_FOLDER=ltsf
 CTX_LEN=96
 PRED_LEN=720
 
@@ -31,7 +33,7 @@ DATA_DIR=./datasets
 LOG_DIR=./log_dir
 
 # Our config lives in THIS repo, not in the benchmark repo.
-CONFIG="${THIS_REPO}/src/configs/${DATASET}/${MODEL}.yaml"
+CONFIG="${THIS_REPO}/src/configs/${CONFIG_FOLDER}/${DATASET}/${MODEL}.yaml"
 # ----------------------------------------------------------------------------
 
 # Make both packages importable. Prepend so our code wins on any name clash.

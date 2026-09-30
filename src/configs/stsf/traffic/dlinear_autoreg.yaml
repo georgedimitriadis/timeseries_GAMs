@@ -19,7 +19,7 @@ model:
       use_lags: false # default true
       use_feat_idx_emb: false # default true
       use_time_feat: false # default true
-  learning_rate: 0.01
+  learning_rate: 0.001
   quantiles_num: 20
 data:
   data_manager:
