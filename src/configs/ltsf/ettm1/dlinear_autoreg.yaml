@@ -1,0 +1,35 @@
+# lightning==2.3.0.dev0
+seed_everything: 1
+trainer:
+  accelerator: gpu
+  devices: 1
+  strategy: auto
+  max_epochs: 50
+  use_distributed_sampler: false
+  limit_train_batches: 100
+  log_every_n_steps: 1
+  default_root_dir: ./results
+model:
+  forecaster:
+    class_path: src.our_models.dlinear_autoreg.DLinearAutoReg
+    init_args:
+      individual: false
+      kernel_size: 3
+      teacher_forcing: false # false = free-running / no teacher forcing
+      use_lags: false # default true
+      use_feat_idx_emb: false # default true
+      use_time_feat: false # default true
+  learning_rate: 0.01
+  quantiles_num: 20
+data:
+  data_manager:
+    class_path: probts.data.data_manager.DataManager
+    init_args:
+      dataset: solar_nips
+      split_val: true
+      scaler: standard # identity, standard, temporal
+      context_length: 96        # required for long-term datasets
+      prediction_length: 96     # required for long-term datasets
+  batch_size: 32
+  test_batch_size: 32
+  num_workers: 8

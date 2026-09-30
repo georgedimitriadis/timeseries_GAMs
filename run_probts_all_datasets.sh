@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #set -euo pipefail
 
-#MODEL=$1
-#if [ -z "$MODEL" ]; then
-#    echo "Usage: $0 <model_name>"
-#    echo "e.g., $0 dlinear"
-#    exit 1
-#fi
+MODEL=$1
+if [ -z "$MODEL" ]; then
+    echo "Usage: $0 <model_name>"
+    echo "e.g., $0 dlinear"
+    exit 1
+fi
 CUDA_VISIBLE_DEVICES=1
 MODEL=dlinear_autoreg
 
@@ -49,17 +49,17 @@ LONG_TERM_DATASETS=(
 )
 
 CTX_LEN=96
-PRED_LENS=(96 132 336 720)
+PRED_LENS=(96 192 336 720)
 
 # Multivariate short-term: default lengths, config/stsf
-for DATASET in "${MULTIVARIATE_DATASETS[@]}"; do
-    echo "=== Running ${MODEL} on ${DATASET} (multivariate, default lengths) ==="
-    echo "${CONFIG_BASE}"/stsf/${DATASET}/${MODEL}.yaml
-    python run.py --config "${CONFIG_BASE}"/stsf/${DATASET}/${MODEL}.yaml --seed_everything 0  \
-            --data.data_manager.init_args.path ${DATA_DIR} \
-            --trainer.default_root_dir ${LOG_DIR} \
-            --data.data_manager.init_args.split_val true
-done
+#for DATASET in "${MULTIVARIATE_DATASETS[@]}"; do
+#    echo "=== Running ${MODEL} on ${DATASET} (multivariate, default lengths) ==="
+#    echo "${CONFIG_BASE}"/stsf/${DATASET}/${MODEL}.yaml
+#    python run.py --config "${CONFIG_BASE}"/stsf/${DATASET}/${MODEL}.yaml --seed_everything 0  \
+#            --data.data_manager.init_args.path ${DATA_DIR} \
+#            --trainer.default_root_dir ${LOG_DIR} \
+#            --data.data_manager.init_args.split_val true
+#done
 
 # Long-term: CTX_LEN=96, sweep PRED_LEN, config/ltsf
 for DATASET in "${LONG_TERM_DATASETS[@]}"; do
@@ -68,7 +68,7 @@ for DATASET in "${LONG_TERM_DATASETS[@]}"; do
         PRED_LEN=620
       fi
       echo "=== Running ${MODEL} on ${DATASET} (ctx=${CTX_LEN}, pred=${PRED_LEN}) ==="
-      python run.py --config "${CONFIG_BASE}"/ltsf_default/${MODEL}.yaml --seed_everything 0 \
+      python run.py --config "${CONFIG_BASE}"/ltsf/"${DATASET}"/${MODEL}.yaml --seed_everything 0 \
           --data.data_manager.init_args.path ${DATA_DIR} \
           --trainer.default_root_dir ${LOG_DIR} \
           --data.data_manager.init_args.dataset ${DATASET} \

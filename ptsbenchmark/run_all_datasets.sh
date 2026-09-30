@@ -28,7 +28,7 @@ LONG_TERM_DATASETS=(
 )
 
 CTX_LEN=96
-PRED_LENS=(96 132 336 720)
+PRED_LENS=(96 192 336 720)
 
 # Multivariate short-term: default lengths, config/stsf
 for DATASET in "${MULTIVARIATE_DATASETS[@]}"; do

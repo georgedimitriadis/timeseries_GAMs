@@ -20,6 +20,12 @@ run_one_pts_dataset_many_cpu:
 		--data.data_manager.init_args.path ./ptsbenchmark/datasets \
 		--trainer.default_root_dir ./src/exps/$(MODEL)
 
+run_all_pts_datasets_dlinear_multistep:
+	./run_probts_all_datasets.sh dlinear
+
+run_all_pts_datasets_dlinear_autoreg:
+	./run_probts_all_datasets.sh dlinear_autoreg
+
 run_nbeats_on_dysts_data_for_paper_lorenz:
 	CUDA_VISIBLE_DEVICES=0 python run_nbeats_on_dysts_data_for_paper.py --systems Lorenz --compare
 
