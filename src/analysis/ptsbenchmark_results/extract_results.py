@@ -2,7 +2,7 @@
 import pandas as pd
 import os
 
-dir = 'src/exps/2026_09_all_data_dlinear_reproduction'
+dir = 'src/exps/2026_09_probTS_alldata_dlinear_multistep_reproduction'
 dir = 'ptsbenchmark/log_dir'
 ltsf_datasets = ['etth1', 'etth2', 'ettm1', 'ettm2', 'traffic_ltsf', 'electricity_ltsf',
     'exchange_ltsf', 'weather_ltsf']

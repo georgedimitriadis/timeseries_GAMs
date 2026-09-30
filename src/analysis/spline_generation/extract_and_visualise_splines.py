@@ -8,7 +8,7 @@ os.environ['KERAS_BACKEND'] = 'jax'
 import numpy as np
 from matplotlib import pyplot as plt
 
-from ec.elco import ECRegressor
+from our_models.ec.elco import ECRegressor
 from ec import spline_responses as sr
 from analysis.visualisation import spline_visualisation as sg
 

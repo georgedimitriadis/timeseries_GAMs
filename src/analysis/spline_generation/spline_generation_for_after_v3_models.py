@@ -7,7 +7,7 @@ import pickle
 import numpy as np
 from matplotlib import pyplot as plt
 
-from ec.elco import ECRegressor
+from our_models.ec.elco import ECRegressor
 from ec import spline_responses as spl_res
 from analysis.visualisation import spline_visualisation as spl_vis
 
