@@ -10,8 +10,8 @@ from sklearn.utils.multiclass import check_classification_targets
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 from tqdm.keras import TqdmCallback
 
-from our_models.ec.evo.emac_fast import EquationLayer
-from our_models.ec.support import CalibratedSparseCrossEntropy
+from our_models.gam_autoreg.ec.evo.emac_fast import EquationLayer
+from our_models.gam_autoreg.ec.support import CalibratedSparseCrossEntropy
 
 from keras import regularizers
 

@@ -1,0 +1,23 @@
+
+# GAM (src/our_models/gam_autoreg) settings for src/run_gams_on_probts.py.
+# Data / trainer settings (batch sizes, epochs, batches per epoch,
+# accumulate_grad_batches, scaler, split_val) come from the ProbTS yaml
+# passed with --probts_config.
+
+model:                         # -> gam_model.GAMConfig
+  lags: [0, 1, 2, 6, 10, 15, 20]          # inputs: values at t-1, t-3, t-9, t-27 (3 to 10 lags)
+  arity: 2                     # 2 = pairwise interactions
+  use_linear: true
+  use_cubic: true
+  use_raw_linear: true
+  mixing_layer_on: false
+  final_linear_layer_regularizer: null
+  ridge_alphas: [0.1, 1.0, 10.0]   # RidgeCV default grid
+  ridge_max_rows: 1000000          # cap on rows per split (train / val) for the ridge fit
+  ridge_batch: 4096
+
+training:                      # -> training_loop.TrainConfig (other fields from the ProbTS yaml)
+  learning_rate: 0.01          # ECBase default
+  weight_decay: 0.004          # keras AdamW default
+  ema_momentum: 0.99           # keras optimizer EMA default
+  fit_ridge: true

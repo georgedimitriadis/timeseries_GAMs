@@ -6,7 +6,7 @@ trainer:
   strategy: auto
   max_epochs: 50
   use_distributed_sampler: false
-  limit_train_batches: 100
+  limit_train_batches: 400
   log_every_n_steps: 1
   accumulate_grad_batches: 4
   default_root_dir: ./results
