@@ -1,5 +1,5 @@
 """
-Step 2 — the autoregressive GAM model.
+Step 2 — the autoregressive GAM model (gam_model.py).
 
 Pipeline (same three stages as the tabular ECMACMethod pipeline, without the
 supplementary linear model):
@@ -54,7 +54,9 @@ from our_models.gam_autoreg.ec.elco import ECRegressor
 # ----------------------------------------------------------------------
 @dataclass
 class GAMConfig:
-    lags: Sequence[int] = (1, 3, 9, 27)         # inputs: values at t-1, t-3, ...
+    lags: Optional[Sequence[int]] = (1, 3, 9, 27)   # inputs: values at t-1, t-3, ...;
+                                                 # None = whole context (1..context_length),
+                                                 # set with resolve_lags(context_length)
     arity: int = 2                               # 2 = pairwise interactions
     use_linear: bool = True
     use_cubic: bool = True
@@ -64,13 +66,23 @@ class GAMConfig:
     ridge_alphas: Sequence[float] = (0.1, 1.0, 10.0)   # RidgeCV default grid
     ridge_max_rows: int = 1_000_000              # cap per split (train / val) for the ridge fit
     ridge_batch: int = 4096                      # series per rollout chunk when collecting features
+    feedback_clip: Optional[float] = 3.0         # clip each prediction to [-c, c] (z space) before
+                                                 # it is fed back; None = no clip
     seed: int = 0
 
     def __post_init__(self):
+        if self.lags is None:                    # resolved later from the context length
+            return
         lags = [int(l) for l in self.lags]
         if any(l < 1 for l in lags) or len(set(lags)) != len(lags):
             raise ValueError(f"lags must be unique integers >= 1, got {self.lags}")
         self.lags = tuple(sorted(lags))
+
+    def resolve_lags(self, context_length: int):
+        """lags=None -> (1, 2, ..., context_length). No effect if lags are given."""
+        if self.lags is None:
+            self.lags = tuple(range(1, int(context_length) + 1))
+        return self
 
 
 # ----------------------------------------------------------------------
@@ -124,6 +136,8 @@ class GAMAutoReg:
     """
 
     def __init__(self, cfg: GAMConfig, n_channels: int):
+        if cfg.lags is None:
+            raise ValueError("cfg.lags is None: call cfg.resolve_lags(context_length) first")
         self.cfg = cfg
         self.n_channels = int(n_channels)
         self.lags = np.asarray(cfg.lags, dtype=np.int32)
@@ -182,6 +196,8 @@ class GAMAutoReg:
             if training:
                 (f, y), ntv_, losses = self.net.stateless_call(tv, ntv_, x, training=True,
                                                                return_losses=True)
+                # EquationLayer adds a loss of shape (1,) (smoothing_weight has shape (1,));
+                # sum to a scalar so the training loss is a scalar.
                 reg = (jnp.sum(jnp.stack([jnp.sum(l) for l in losses])).astype(jnp.float32)
                        if losses else jnp.asarray(0.0, jnp.float32))
             else:
@@ -189,6 +205,8 @@ class GAMAutoReg:
                 reg = jnp.asarray(0.0, jnp.float32)
             y = (f @ ridge_coef + ridge_intercept) if use_ridge else y[:, 0]
             y = y.astype(jnp.float32)
+            if self.cfg.feedback_clip is not None:
+                y = jnp.clip(y, -self.cfg.feedback_clip, self.cfg.feedback_clip)
             b = jnp.concatenate([b[:, 1:], y[:, None]], axis=1)          # feed prediction back
             out = (y, reg, f) if return_features else (y, reg)
             return (b, ntv_), out

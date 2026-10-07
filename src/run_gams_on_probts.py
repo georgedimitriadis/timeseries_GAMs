@@ -1,4 +1,3 @@
-
 """
 Step 4 — experiment 3: GAM (ec) on ProbTS data, autoregressive, no teacher forcing.
 
@@ -139,6 +138,7 @@ def main():
     t0 = time.time()
     data = load_probts_data(**data_args)
     meta = data.meta
+    gam_cfg.resolve_lags(meta.context_length)      # lags: null -> 1..context_length
     check_lags(gam_cfg.lags, meta)
     tag = result_tag(meta.dataset, meta.context_length, meta.prediction_length, seed)
     save_dir = Path(args.root_dir) / tag

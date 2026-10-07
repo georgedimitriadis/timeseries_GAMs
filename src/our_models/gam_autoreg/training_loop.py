@@ -125,14 +125,17 @@ def make_train_fns(model: GAMAutoReg, optimizer, H: int, ema_momentum: float):
         se_w = jnp.where(w != 0, se * w, 0.0)                            # probts weighted_average
         per_row = se_w.sum(axis=1) / jnp.maximum(w.sum(axis=1), 1.0)
         mse = per_row.mean()
-        return mse + reg, (ntv, mse)
+        clip = model.cfg.feedback_clip
+        frac_clipped = (jnp.mean(jnp.abs(z_pred) >= clip) if clip is not None
+                        else jnp.asarray(0.0))  # share of predictions at the bound
+        return mse + reg, (ntv, mse, frac_clipped)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
 
     @jax.jit
     def compute_grads(tv, ntv, buf, future_s, w, lo, hi):
-        (loss, (ntv, mse)), grads = grad_fn(tv, ntv, buf, future_s, w, lo, hi)
-        return grads, ntv, loss, mse
+        (loss, (ntv, mse, frac_clipped)), grads = grad_fn(tv, ntv, buf, future_s, w, lo, hi)
+        return grads, ntv, loss, mse, frac_clipped
 
     @jax.jit
     def apply_grads(tv, opt_vars, ema, grads):
@@ -184,11 +187,11 @@ def train_gam(model: GAMAutoReg, data: ProbTSData, cfg: TrainConfig) -> TrainRes
     history = []
     for epoch in range(cfg.max_epochs):
         t0 = time.time()
-        losses, mses = [], []
+        losses, mses, clipped = [], [], []
         acc, n_acc = None, 0
         for _ in range(cfg.batches_per_epoch):
             batch = prepare_batch(model, *data.train.sample_batch(rng, cfg.batch_size))
-            grads, ntv, loss, mse = compute_grads(tv, ntv, *batch)
+            grads, ntv, loss, mse, frac_clipped  = compute_grads(tv, ntv, *batch)
             acc = grads if acc is None else [a + g for a, g in zip(acc, grads)]
             n_acc += 1
             if n_acc == accum:
@@ -196,6 +199,7 @@ def train_gam(model: GAMAutoReg, data: ProbTSData, cfg: TrainConfig) -> TrainRes
                 acc, n_acc = None, 0
             losses.append(float(loss))
             mses.append(float(mse))
+            clipped.append(float(frac_clipped))
         if n_acc > 0:                                         # leftover accumulated batches
             tv, opt_vars, ema = apply_grads(tv, opt_vars, ema, [g / n_acc for g in acc])
 
@@ -204,7 +208,8 @@ def train_gam(model: GAMAutoReg, data: ProbTSData, cfg: TrainConfig) -> TrainRes
         val = evaluate_probts(model, data.val, data.scaler, freq, cfg.eval_batch_size,
                               "val", cfg.quantiles_num, use_ridge=False)
         rec = {"epoch": epoch, "train_loss": float(np.mean(losses)),
-               "train_mse": float(np.mean(mses)), "val_ND": val["val_ND"],
+               "train_mse": float(np.mean(mses)),
+               "frac_clipped": float(np.mean(clipped)), "val_ND": val["val_ND"],
                "val_CRPS": val["val_CRPS"], "epoch_time_s": round(time.time() - t0, 2)}
         history.append(rec)
         log(rec)
