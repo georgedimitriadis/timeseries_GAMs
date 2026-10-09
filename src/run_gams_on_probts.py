@@ -47,7 +47,7 @@ import pandas as pd
 import torch
 import yaml
 
-from our_models.gam_autoreg.data import load_probts_data
+from our_models.gam_autoreg.for_probts.data import load_probts_data
 from our_models.gam_autoreg.gam_model import GAMAutoReg, GAMConfig
 from our_models.gam_autoreg.training_loop import TrainConfig, evaluate_probts, train_gam
 

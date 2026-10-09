@@ -45,7 +45,7 @@ import numpy as np
 from keras import layers
 from sklearn.linear_model import RidgeCV
 
-from our_models.gam_autoreg.data import EvalWindows, TrainWindows, predefined_split, to_series
+from our_models.gam_autoreg.windows import EvalWindows, TrainWindows, predefined_split, to_series
 from our_models.gam_autoreg.ec.elco import ECRegressor
 
 

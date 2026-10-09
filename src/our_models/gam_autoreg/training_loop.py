@@ -1,28 +1,33 @@
 """
-Step 3 — training loop for the autoregressive GAM (no teacher forcing).
+Step 3 — training loop for the autoregressive GAM, no teacher forcing.
+General: used by both the ProbTS and the dysts pipelines.
 
-    result = train_gam(model, data, TrainConfig(...))
+    result = train_gam(model, train, val, TrainConfig(...), evaluate,
+                       select_metric="val_CRPS", log_metrics=("val_ND", "val_CRPS"))
+
+    evaluate(model, windows, stage=..., use_ridge=...) -> dict of metrics
+        pipeline-specific (for_probts/evaluation.py, for_dysts/evaluation.py);
+        keys are prefixed with the stage, e.g. "val_CRPS". Lower = better for
+        select_metric.
 
 What it does
 ------------
-1. Fits the per-channel MinMax scaler on the train split (model.fit_scaler).
+1. Fits the per-channel MinMax scaler on the train series (model.fit_scaler).
 2. Trains the ec network + Dense(1) head on free-running rollouts:
      - batch      : TrainWindows.sample_batch -> rows (one per window x channel)
-     - forward    : model.rollout(training=True) over the full prediction length,
+     - forward    : model.rollout(training=True) over train.prediction_length steps,
                     each prediction fed back as the newest input
-     - loss       : MSE in the standard-scaled space, weighted by the observed
-                    mask (as ProbTS Forecaster.get_weighted_loss), plus the
-                    EquationLayer penalty
+     - loss       : MSE in the train-series space (standard-scaled for ProbTS,
+                    original for dysts), weighted by the observed mask (as ProbTS
+                    Forecaster.get_weighted_loss), plus the EquationLayer penalty
      - optimiser  : keras AdamW (stateless, on the JAX backend) + EMA of the
                     weights; EMA weights are used for every evaluation, as
                     AdamW(use_ema=True) + SwapEMAWeights in ECBase._fit
-     - accumulate_grad_batches as in the ProbTS configs
-3. After every epoch: val metrics with the ProbTS Evaluator (denormalised);
-   the epoch with the lowest val_CRPS is kept (run.py's checkpoint rule).
+     - accumulate_grad_batches
+3. After every epoch: evaluate(val) with the Dense(1) head; the epoch with the
+   lowest select_metric is kept.
 4. Puts the best weights in the model and fits the RidgeCV head on rollout
    features (model.fit_ridge); reports val metrics with both heads.
-
-evaluate_probts() is also used by the experiment script for the test set.
 """
 
 from __future__ import annotations
@@ -34,17 +39,15 @@ os.environ.setdefault("KERAS_BACKEND", "jax")
 import json
 import time
 from dataclasses import dataclass, field, asdict
-from typing import Optional
+from typing import Callable, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
 import keras
 import numpy as np
-import torch
 
-from probts.utils.evaluator import Evaluator
-from our_models.gam_autoreg.data import EvalWindows, ProbTSData, series_weights, to_series
 from our_models.gam_autoreg.gam_model import ChannelMinMaxScaler, GAMAutoReg
+from our_models.gam_autoreg.windows import EvalWindows, TrainWindows, series_weights, to_series
 
 
 # ----------------------------------------------------------------------
@@ -52,15 +55,15 @@ from our_models.gam_autoreg.gam_model import ChannelMinMaxScaler, GAMAutoReg
 # ----------------------------------------------------------------------
 @dataclass
 class TrainConfig:
-    max_epochs: int = 50                  # ProbTS trainer.max_epochs
-    batches_per_epoch: int = 100          # ProbTS trainer.limit_train_batches
-    batch_size: int = 32                  # ProbTS data.batch_size (windows; rows = batch_size * C)
-    accumulate_grad_batches: int = 1      # ProbTS trainer.accumulate_grad_batches
-    eval_batch_size: int = 32             # ProbTS data.test_batch_size (metric averaging per batch)
+    max_epochs: int = 50                  # (ProbTS: trainer.max_epochs)
+    batches_per_epoch: int = 100          # (ProbTS: trainer.limit_train_batches)
+    batch_size: int = 32                  # windows per batch; rows = batch_size * C
+    accumulate_grad_batches: int = 1      # (ProbTS: trainer.accumulate_grad_batches)
+    eval_batch_size: int = 32             # (ProbTS: data.test_batch_size, metric averaging per batch)
     learning_rate: float = 0.01           # ECBase default
     weight_decay: float = 0.004           # keras AdamW default
     ema_momentum: float = 0.99            # keras optimizer EMA default
-    quantiles_num: int = 20               # ProbTS configs
+    quantiles_num: int = 20               # ProbTS Evaluator (unused for dysts)
     fit_ridge: bool = True
     seed: int = 0
     verbose: bool = True
@@ -76,33 +79,6 @@ class TrainResult:
     val_ridge: Optional[dict] = None      # val metrics, ridge head
     ridge: Optional[dict] = None
     train_time_s: float = 0.0
-
-
-# ----------------------------------------------------------------------
-# Evaluation (ProbTS metrics)
-# ----------------------------------------------------------------------
-def evaluate_probts(model: GAMAutoReg, windows: EvalWindows, probts_scaler, freq: str,
-                    batch_size: int, stage: str, quantiles_num: int = 20,
-                    use_ridge: Optional[bool] = None) -> dict:
-    """
-    Same computation as ProbTSForecastModule.evaluate + calculate_weighted_average:
-    per batch of `batch_size` windows, ProbTS Evaluator on denormalised forecasts
-    [B, 1, H, C] against the raw future; batch-size weighted mean over batches.
-    Keys: f"{stage}_ND", f"{stage}_CRPS", ...
-    """
-    evaluator = Evaluator(quantiles_num=quantiles_num)
-    H = windows.future.shape[1]
-    pred_s = model.forecast(windows.past_s, H, use_ridge=use_ridge)            # [N, H, C] standard-scaled
-    values, sizes = {}, []
-    for sl in windows.batches(batch_size):
-        denorm = probts_scaler.inverse_transform(torch.from_numpy(pred_s[sl]).float())
-        metrics = evaluator(torch.from_numpy(windows.future[sl]), denorm.unsqueeze(1),
-                            past_data=torch.from_numpy(windows.past[sl]), freq=freq)
-        sizes.append(windows.future[sl].shape[0])
-        for k, v in metrics.items():
-            values.setdefault(f"{stage}_{k}", []).append(v)
-    w = np.asarray(sizes, dtype=np.float64)
-    return {k: float(np.sum(np.asarray(v, dtype=np.float64) * w) / w.sum()) for k, v in values.items()}
 
 
 # ----------------------------------------------------------------------
@@ -127,7 +103,7 @@ def make_train_fns(model: GAMAutoReg, optimizer, H: int, ema_momentum: float):
         mse = per_row.mean()
         clip = model.cfg.feedback_clip
         frac_clipped = (jnp.mean(jnp.abs(z_pred) >= clip) if clip is not None
-                        else jnp.asarray(0.0))  # share of predictions at the bound
+                        else jnp.asarray(0.0))                           # share of predictions at the bound
         return mse + reg, (ntv, mse, frac_clipped)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
@@ -158,11 +134,20 @@ def prepare_batch(model: GAMAutoReg, past, future, obs):
 # ----------------------------------------------------------------------
 # Training loop
 # ----------------------------------------------------------------------
-def train_gam(model: GAMAutoReg, data: ProbTSData, cfg: TrainConfig) -> TrainResult:
-    if data.val is None:
+def train_gam(model: GAMAutoReg, train: TrainWindows, val: EvalWindows, cfg: TrainConfig,
+              evaluate: Callable[..., dict], select_metric: str = "val_CRPS",
+              log_metrics: Sequence[str] = ()) -> TrainResult:
+    """
+    train          TrainWindows (training rollouts of train.prediction_length steps)
+    val            EvalWindows  (epoch selection and RidgeCV fold)
+    evaluate       evaluate(model, windows, stage=..., use_ridge=...) -> dict
+    select_metric  key of the evaluate() output used to pick the epoch (lower = better)
+    log_metrics    extra evaluate() keys written to the epoch log
+    """
+    if val is None:
         raise ValueError("A validation split is needed (model selection and RidgeCV).")
     t_start = time.time()
-    H, freq = data.meta.prediction_length, data.meta.freq
+    H = train.prediction_length
     rng = np.random.default_rng(cfg.seed)
     keras.utils.set_random_seed(cfg.seed)
 
@@ -171,7 +156,7 @@ def train_gam(model: GAMAutoReg, data: ProbTSData, cfg: TrainConfig) -> TrainRes
             print(json.dumps(rec), flush=True)
 
     # 1. scaler
-    model.fit_scaler(data.train)
+    model.fit_scaler(train)
 
     # 2. optimiser state (keras stateless API)
     optimizer = keras.optimizers.AdamW(learning_rate=cfg.learning_rate,
@@ -190,8 +175,8 @@ def train_gam(model: GAMAutoReg, data: ProbTSData, cfg: TrainConfig) -> TrainRes
         losses, mses, clipped = [], [], []
         acc, n_acc = None, 0
         for _ in range(cfg.batches_per_epoch):
-            batch = prepare_batch(model, *data.train.sample_batch(rng, cfg.batch_size))
-            grads, ntv, loss, mse, frac_clipped  = compute_grads(tv, ntv, *batch)
+            batch = prepare_batch(model, *train.sample_batch(rng, cfg.batch_size))
+            grads, ntv, loss, mse, frac_clipped = compute_grads(tv, ntv, *batch)
             acc = grads if acc is None else [a + g for a, g in zip(acc, grads)]
             n_acc += 1
             if n_acc == accum:
@@ -205,30 +190,29 @@ def train_gam(model: GAMAutoReg, data: ProbTSData, cfg: TrainConfig) -> TrainRes
 
         # 3. validation with the EMA weights, Dense(1) head
         model.set_params(ema, ntv)
-        val = evaluate_probts(model, data.val, data.scaler, freq, cfg.eval_batch_size,
-                              "val", cfg.quantiles_num, use_ridge=False)
+        val_m = evaluate(model, val, stage="val", use_ridge=False)
+        score = val_m[select_metric]
         rec = {"epoch": epoch, "train_loss": float(np.mean(losses)),
                "train_mse": float(np.mean(mses)),
-               "frac_clipped": float(np.mean(clipped)), "val_ND": val["val_ND"],
-               "val_CRPS": val["val_CRPS"], "epoch_time_s": round(time.time() - t0, 2)}
+               "frac_clipped": float(np.mean(clipped)),
+               **{k: val_m[k] for k in log_metrics if k != select_metric},
+               select_metric: score, "epoch_time_s": round(time.time() - t0, 2)}
         history.append(rec)
         log(rec)
-        if np.isfinite(val["val_CRPS"]) and val["val_CRPS"] < best["score"]:
-            best = {"score": float(val["val_CRPS"]), "epoch": epoch,
+        if score is not None and np.isfinite(score) and score < best["score"]:
+            best = {"score": float(score), "epoch": epoch,
                     "tv": [jnp.array(e) for e in ema], "ntv": ntv}
 
     # 4. best weights -> model; ridge head on rollout features
     model.set_params(best["tv"], best["ntv"])
     result = TrainResult(best_epoch=best["epoch"], best_score=best["score"],
-                         selection_metric="val_CRPS", history=history)
-    result.val_dense = evaluate_probts(model, data.val, data.scaler, freq, cfg.eval_batch_size,
-                                       "val", cfg.quantiles_num, use_ridge=False)
+                         selection_metric=select_metric, history=history)
+    result.val_dense = evaluate(model, val, stage="val", use_ridge=False)
     if cfg.fit_ridge:
-        result.ridge = model.fit_ridge(data.train, data.val)
-        result.val_ridge = evaluate_probts(model, data.val, data.scaler, freq, cfg.eval_batch_size,
-                                           "val", cfg.quantiles_num, use_ridge=True)
-    log({"best_epoch": result.best_epoch, "val_CRPS_dense": result.val_dense["val_CRPS"],
-         "val_CRPS_ridge": result.val_ridge["val_CRPS"] if result.val_ridge else None,
+        result.ridge = model.fit_ridge(train, val)
+        result.val_ridge = evaluate(model, val, stage="val", use_ridge=True)
+    log({"best_epoch": result.best_epoch, f"{select_metric}_dense": result.val_dense[select_metric],
+         f"{select_metric}_ridge": result.val_ridge[select_metric] if result.val_ridge else None,
          "ridge_alpha": result.ridge["alpha"] if result.ridge else None})
     result.train_time_s = time.time() - t_start
     return result

@@ -26,6 +26,9 @@ run_all_pts_datasets_dlinear_multistep:
 run_all_pts_datasets_dlinear_autoreg:
 	CUDA_VISIBLE_DEVICES=0 ./run_probts_all_datasets.sh dlinear_autoreg
 
+run_all_pts_datasets_gams_autoreg:
+	./run_gams_on_probts_all_datasets.sh
+
 run_nbeats_on_dysts_data_for_paper_lorenz:
 	CUDA_VISIBLE_DEVICES=0 python run_nbeats_on_dysts_data_for_paper.py --systems Lorenz --compare
 
