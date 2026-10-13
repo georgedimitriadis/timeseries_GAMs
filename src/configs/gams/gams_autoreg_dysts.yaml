@@ -1,0 +1,38 @@
+# GAM (src/our_models/gam_autoreg) settings for src/run_gams_on_dysts.py (one dysts system).
+
+data:                          # -> for_dysts.dysts_data.load_dysts_system
+  history_length: 100          # L: values before each forecast start given to the model (>= max lag)
+  train_horizon: 200           # rollout length of the training windows (free-running)
+  val_starts: [200, 400, 600, 800, 1000]   # val windows in the val_file trajectory
+  val_horizon: 200
+  train_file: train            # train (values[:1000]) and test (values[1000:1200]), as the N-BEATS script
+  val_file: test               # val trajectory (different initial condition)
+
+model:                         # -> for_dysts.dysts_gam_model.DystsGAMConfig
+  lags: [1, 3, 9, 27]          # per coordinate; inputs = D * len(lags); null = 1..history_length
+  arity: 2                     # 2 = pairwise interactions (incl. across coordinates)
+  use_linear: true
+  use_cubic: true
+  use_raw_linear: true
+  mixing_layer_on: false
+  final_linear_layer_regularizer: null
+  ridge_alphas: [0.1, 1.0, 10.0]   # RidgeCV default grid
+  ridge_max_rows: 1000000          # cap on train rows (window x step) for the ridge fit
+  ridge_batch: 4096
+  feedback_clip: 3.0           # clip each fed-back prediction to [-3, 3] (z space); null = off
+  predict_increment: false     # true: each GAM outputs (x[t] - x[t-1]) / dt in the original units
+
+training:                      # -> for_dysts.dysts_training_loop.DystsTrainConfig
+  max_epochs: 100              # Darts default (N-BEATS)
+  batch_size: 32               # Darts default
+  batches_per_epoch: null      # null = one pass over the training windows
+  accumulate_grad_batches: 1
+  learning_rate: 0.01          # ECBase default
+  weight_decay: 0.004          # keras AdamW default
+  ema_momentum: 0.99           # keras optimizer EMA default
+  global_clipnorm: null        # gradient clipping (null = off)
+  patience: null               # early stopping on val_smape (null = off)
+  fit_ridge: true
+
+evaluation:
+  threshold: 50.0              # valid-horizon sMAPE threshold (0-100 scale), as the N-BEATS script

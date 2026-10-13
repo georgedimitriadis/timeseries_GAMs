@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 from probts.utils.evaluator import Evaluator
-from our_models.gam_autoreg.gam_model import GAMAutoReg
+from our_models.gam_autoreg.for_probts.probts_gam_model import GAMAutoReg
 from our_models.gam_autoreg.windows import EvalWindows
 
 

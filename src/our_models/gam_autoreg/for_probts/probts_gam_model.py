@@ -1,5 +1,5 @@
 """
-Step 2 — the autoregressive GAM model (gam_model.py).
+Step 2 (ProbTS) — the autoregressive GAM model for the ProbTS data.
 
 Pipeline (same three stages as the tabular ECMACMethod pipeline, without the
 supplementary linear model):
@@ -19,13 +19,12 @@ The network maps the values at the lags (in z) to the next value (in z), so a
 prediction can be fed back as an input. Forecasts are mapped back with the
 inverse before the loss / metrics.
 
-One model is shared by all channels; a row of data is one channel of one
-window (data.to_series layout: row n*C + c).
+One network is shared by all channels (channel-independent, as DLinear with
+individual=false); a row of data is one channel of one window
+(windows.to_series layout: row n*C + c).
 
-What this module does NOT do: the optimisation loop (training.py) and the
-experiment script (step 4).
-
-Keras runs on the JAX backend; KERAS_BACKEND is set before keras is imported.
+Shared parts (config, scaler, network builder, ridge fit, parameter handling):
+basis_gam_model.py.
 """
 
 from __future__ import annotations
@@ -34,105 +33,23 @@ import os
 
 os.environ.setdefault("KERAS_BACKEND", "jax")
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict
 from functools import partial
-from typing import Optional, Sequence
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
-import keras
 import numpy as np
-from keras import layers
-from sklearn.linear_model import RidgeCV
 
-from our_models.gam_autoreg.windows import EvalWindows, TrainWindows, predefined_split, to_series
-from our_models.gam_autoreg.ec.elco import ECRegressor
-
-
-# ----------------------------------------------------------------------
-# Config
-# ----------------------------------------------------------------------
-@dataclass
-class GAMConfig:
-    lags: Optional[Sequence[int]] = (1, 3, 9, 27)   # inputs: values at t-1, t-3, ...;
-                                                 # None = whole context (1..context_length),
-                                                 # set with resolve_lags(context_length)
-    arity: int = 2                               # 2 = pairwise interactions
-    use_linear: bool = True
-    use_cubic: bool = True
-    use_raw_linear: bool = True
-    mixing_layer_on: bool = False
-    final_linear_layer_regularizer: Optional[str] = None
-    ridge_alphas: Sequence[float] = (0.1, 1.0, 10.0)   # RidgeCV default grid
-    ridge_max_rows: int = 1_000_000              # cap per split (train / val) for the ridge fit
-    ridge_batch: int = 4096                      # series per rollout chunk when collecting features
-    feedback_clip: Optional[float] = 3.0         # clip each prediction to [-c, c] (z space) before
-                                                 # it is fed back; None = no clip
-    seed: int = 0
-
-    def __post_init__(self):
-        if self.lags is None:                    # resolved later from the context length
-            return
-        lags = [int(l) for l in self.lags]
-        if any(l < 1 for l in lags) or len(set(lags)) != len(lags):
-            raise ValueError(f"lags must be unique integers >= 1, got {self.lags}")
-        self.lags = tuple(sorted(lags))
-
-    def resolve_lags(self, context_length: int):
-        """lags=None -> (1, 2, ..., context_length). No effect if lags are given."""
-        if self.lags is None:
-            self.lags = tuple(range(1, int(context_length) + 1))
-        return self
+from our_models.gam_autoreg.basis_gam_model import (  # noqa: F401  (GAMConfig, ChannelMinMaxScaler re-exported)
+    BaseGAM, ChannelMinMaxScaler, GAMConfig, call_network, fit_ridge_cv)
+from our_models.gam_autoreg.windows import EvalWindows, TrainWindows, to_series
 
 
-# ----------------------------------------------------------------------
-# Stage 1: scaler
-# ----------------------------------------------------------------------
-class ChannelMinMaxScaler:
-    """Per-channel min/max -> [-1, 1]. Fitted on the (standard-scaled) train series."""
-
-    def __init__(self):
-        self.lo = None      # [C]
-        self.hi = None      # [C]
-
-    def fit(self, series: np.ndarray, observed: Optional[np.ndarray] = None):
-        """series [T, C]; missing values (observed == 0) are ignored."""
-        x = series.astype(np.float64)
-        if observed is not None:
-            x = np.where(observed > 0, x, np.nan)
-        self.lo = np.nanmin(x, axis=0).astype(np.float32)
-        self.hi = np.nanmax(x, axis=0).astype(np.float32)
-        same = self.hi - self.lo < 1e-8                  # constant channel
-        self.hi = np.where(same, self.lo + 1.0, self.hi)
-        return self
-
-    def row_params(self, n_rows: int):
-        """lo, hi for rows in data.to_series layout (channel = row % C)."""
-        C = len(self.lo)
-        ch = np.arange(n_rows) % C
-        return self.lo[ch], self.hi[ch]
-
-    @staticmethod
-    def transform_rows(x, lo, hi):
-        """x [n, L] -> z; lo, hi [n]. Works for numpy and jax arrays."""
-        return 2.0 * (x - lo[:, None]) / (hi[:, None] - lo[:, None]) - 1.0
-
-    @staticmethod
-    def inverse_rows(z, lo, hi):
-        return (z + 1.0) / 2.0 * (hi[:, None] - lo[:, None]) + lo[:, None]
-
-
-# ----------------------------------------------------------------------
-# Stage 2 + 3: network, rollout, ridge head
-# ----------------------------------------------------------------------
-class GAMAutoReg:
+class GAMAutoReg(BaseGAM):
     """
     Holds the three stages and the pure-JAX rollout used for training and
-    forecasting.
-
-    Parameters of the network are kept outside keras as two lists of arrays,
-    (tv, ntv) = (trainable, non-trainable) variables, so the training loop can
-    differentiate through the rollout with jax (keras "stateless" API).
+    forecasting. One network (self.net); weights in (self.tv, self.ntv).
     """
 
     def __init__(self, cfg: GAMConfig, n_channels: int):
@@ -144,29 +61,14 @@ class GAMAutoReg:
         self.max_lag = int(self.lags.max())
         self.lag_pos = jnp.asarray(self.max_lag - self.lags)   # column of each lag in the buffer
 
-        self.scaler = ChannelMinMaxScaler()
-
-        # ec network: inputs -> (optional mixing) -> EquationLayer -> Dropout -> Dense(1)
-        ec = ECRegressor(arity=cfg.arity, mixing_layer_on=cfg.mixing_layer_on,
-                         use_linear=cfg.use_linear, use_cubic=cfg.use_cubic,
-                         use_raw_linear=cfg.use_raw_linear,
-                         final_linear_layer_regularizer=cfg.final_linear_layer_regularizer)
-        _, inputs, self.equation_layer, feats = ec.get_features(n_inputs=len(self.lags))
-        out = layers.Dense(1, kernel_regularizer=ec.linear_layer_regularizer)(feats)
-        self.net = keras.Model(inputs, [feats, out])            # returns features and prediction
-        self.n_features = int(feats.shape[-1])
-
-        self.tv = [v.value for v in self.net.trainable_variables]
-        self.ntv = [v.value for v in self.net.non_trainable_variables]
+        self._init_networks(cfg, n_inputs=len(self.lags), names=["gam"])
+        self.net = self.nets[0]
+        self.equation_layer = self.equation_layers[0]
 
         # ridge head (set by fit_ridge); None -> use the Dense(1) head
         self.ridge = None   # dict(coef [F], intercept, alpha)
 
     # ---------------- scaling ----------------
-    def fit_scaler(self, train: TrainWindows):
-        self.scaler.fit(train.series, train.observed)
-        return self
-
     def to_z(self, x_rows: np.ndarray):
         lo, hi = self.scaler.row_params(x_rows.shape[0])
         return self.scaler.transform_rows(x_rows, lo, hi)
@@ -193,18 +95,9 @@ class GAMAutoReg:
         def step(carry, _):
             b, ntv_ = carry
             x = jnp.take(b, self.lag_pos, axis=1)                         # [n, n_lags]
-            if training:
-                (f, y), ntv_, losses = self.net.stateless_call(tv, ntv_, x, training=True,
-                                                               return_losses=True)
-                # EquationLayer adds a loss of shape (1,) (smoothing_weight has shape (1,));
-                # sum to a scalar so the training loss is a scalar.
-                reg = (jnp.sum(jnp.stack([jnp.sum(l) for l in losses])).astype(jnp.float32)
-                       if losses else jnp.asarray(0.0, jnp.float32))
-            else:
-                (f, y), ntv_ = self.net.stateless_call(tv, ntv_, x, training=False)
-                reg = jnp.asarray(0.0, jnp.float32)
-            y = (f @ ridge_coef + ridge_intercept) if use_ridge else y[:, 0]
-            y = y.astype(jnp.float32)
+            f, y, ntv_, reg = call_network(self.net, tv, ntv_, x, training)
+            if use_ridge:
+                y = (f @ ridge_coef + ridge_intercept).astype(jnp.float32)
             if self.cfg.feedback_clip is not None:
                 y = jnp.clip(y, -self.cfg.feedback_clip, self.cfg.feedback_clip)
             b = jnp.concatenate([b[:, 1:], y[:, None]], axis=1)          # feed prediction back
@@ -303,29 +196,13 @@ class GAMAutoReg:
         lo, hi = self.scaler.lo[c], self.scaler.hi[c]
         X_va, y_va = self._collect(p, f, o, lo, hi)
 
-        ridge = RidgeCV(alphas=tuple(self.cfg.ridge_alphas),
-                        cv=predefined_split(len(y_tr), len(y_va)))
-        ridge.fit(np.concatenate([X_tr, X_va]), np.concatenate([y_tr, y_va]))
-        self.ridge = {"coef": np.asarray(ridge.coef_, dtype=np.float32),
-                      "intercept": np.float32(ridge.intercept_),
-                      "alpha": float(ridge.alpha_),
-                      "n_train_rows": int(len(y_tr)), "n_val_rows": int(len(y_va))}
+        self.ridge = fit_ridge_cv(X_tr, y_tr, X_va, y_va, self.cfg.ridge_alphas)
         return self.ridge
 
     def _ridge_arrays(self):
         return jnp.asarray(self.ridge["coef"]), jnp.asarray(self.ridge["intercept"])
 
     # ---------------- state ----------------
-    def set_params(self, tv, ntv):
-        self.tv, self.ntv = list(tv), list(ntv)
-
-    def sync_to_keras(self):
-        """Copy (tv, ntv) into the keras variables (for saving / get_active_features)."""
-        for v, x in zip(self.net.trainable_variables, self.tv):
-            v.assign(x)
-        for v, x in zip(self.net.non_trainable_variables, self.ntv):
-            v.assign(x)
-
     def active_features(self):
         self.sync_to_keras()
         return self.equation_layer.get_active_features()
@@ -336,6 +213,6 @@ class GAMAutoReg:
             "config": asdict(self.cfg),
             "n_channels": self.n_channels,
             "scaler_lo": self.scaler.lo, "scaler_hi": self.scaler.hi,
-            "weights": {v.path: np.asarray(v.value) for v in self.net.weights},
+            "weights": self.network_weights()[0],
             "ridge": self.ridge,
         }

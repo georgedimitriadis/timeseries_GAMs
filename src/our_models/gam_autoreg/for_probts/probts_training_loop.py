@@ -38,7 +38,7 @@ os.environ.setdefault("KERAS_BACKEND", "jax")
 
 import json
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
 import jax
@@ -46,7 +46,7 @@ import jax.numpy as jnp
 import keras
 import numpy as np
 
-from our_models.gam_autoreg.gam_model import ChannelMinMaxScaler, GAMAutoReg
+from our_models.gam_autoreg.for_probts.probts_gam_model import ChannelMinMaxScaler, GAMAutoReg
 from our_models.gam_autoreg.windows import EvalWindows, TrainWindows, series_weights, to_series
 
 

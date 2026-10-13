@@ -3,7 +3,7 @@
 # accumulate_grad_batches, scaler, split_val) come from the ProbTS yaml
 # passed with --probts_config.
 
-model:                         # -> gam_model.GAMConfig
+model:                         # -> basis_gam_model.GAMConfig
   lags: null          # inputs: values at t-1, t-3, t-9, t-27 (3 to 10 lags)
                                # null = whole context: [1, 2, ..., context_length]
   arity: 1                     # 2 = pairwise interactions
@@ -17,7 +17,7 @@ model:                         # -> gam_model.GAMConfig
   ridge_batch: 512 # 4096
   feedback_clip: 3.0             # clip each fed-back prediction to [-3, 3] (z space); null = off
 
-training:                      # -> training_loop.TrainConfig (other fields from the ProbTS yaml)
+training:                      # -> for_probts.probts_training_loop.TrainConfig (other fields from the ProbTS yaml)
   learning_rate: 0.05          # ECBase default
   weight_decay: 0.004          # keras AdamW default
   ema_momentum: 0.99           # keras optimizer EMA default

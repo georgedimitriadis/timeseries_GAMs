@@ -9,7 +9,7 @@ Settings
                  Used for: dataset, scaler, split_val, context/prediction length,
                  batch_size, test_batch_size, max_epochs, limit_train_batches,
                  accumulate_grad_batches, seed_everything.
---gam_config     src/configs/gams/gams_autoreg.yaml: `model` -> GAMConfig,
+--gam_config     src/configs/gams/gams_autoreg_probts.yaml: `model` -> GAMConfig,
                  `training` -> learning rate, weight decay, EMA, fit_ridge.
 Command-line arguments override both.
 
@@ -40,6 +40,7 @@ import pickle
 import time
 import warnings
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -47,9 +48,10 @@ import pandas as pd
 import torch
 import yaml
 
-from our_models.gam_autoreg.for_probts.data import load_probts_data
-from our_models.gam_autoreg.gam_model import GAMAutoReg, GAMConfig
-from our_models.gam_autoreg.training_loop import TrainConfig, evaluate_probts, train_gam
+from our_models.gam_autoreg.for_probts.probts_data import load_probts_data
+from our_models.gam_autoreg.for_probts.probts_evaluation import evaluate_probts
+from our_models.gam_autoreg.for_probts.probts_gam_model import GAMAutoReg, GAMConfig
+from our_models.gam_autoreg.for_probts.probts_training_loop import TrainConfig, train_gam
 
 MODEL_NAME = "GAMAutoReg"   # no underscore: extract_results.py splits folder names on "_"
 REPO_DIR = Path(__file__).resolve().parent.parent
@@ -58,7 +60,7 @@ REPO_DIR = Path(__file__).resolve().parent.parent
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     p.add_argument("--probts_config", required=True)
-    p.add_argument("--gam_config", default=str(REPO_DIR / "src/configs/gams/gams_autoreg.yaml"))
+    p.add_argument("--gam_config", default=str(REPO_DIR / "src/configs/gams/gams_autoreg_probts.yaml"))
     p.add_argument("--dataset", default=None)
     p.add_argument("--context_length", type=int, default=None)
     p.add_argument("--prediction_length", type=int, default=None)
@@ -151,17 +153,17 @@ def main():
     model = GAMAutoReg(gam_cfg, n_channels=meta.target_dim)
 
     # 3. training (+ ridge)
-    result = train_gam(model, data, train_cfg)
+    evaluate = partial(evaluate_probts, probts_scaler=data.scaler, freq=meta.freq,
+                       batch_size=train_cfg.eval_batch_size, quantiles_num=train_cfg.quantiles_num)
+    result = train_gam(model, data.train, data.val, train_cfg, evaluate,
+                       select_metric="val_CRPS", log_metrics=("val_ND", "val_CRPS"))
 
     # 4. test
     t_test = time.time()
     use_ridge = model.ridge is not None
-    test = evaluate_probts(model, data.test, data.scaler, meta.freq, train_cfg.eval_batch_size,
-                           "test", train_cfg.quantiles_num, use_ridge=use_ridge)
+    test = evaluate(model, data.test, stage="test", use_ridge=use_ridge)
     test_time = time.time() - t_test
-    test_dense = (evaluate_probts(model, data.test, data.scaler, meta.freq,
-                                  train_cfg.eval_batch_size, "test", train_cfg.quantiles_num,
-                                  use_ridge=False) if use_ridge else test)
+    test_dense = evaluate(model, data.test, stage="test", use_ridge=False) if use_ridge else test
     print(f"[{tag}] test_ND={test['test_ND']:.4f} test_CRPS={test['test_CRPS']:.4f} "
           f"(dense head: {test_dense['test_CRPS']:.4f})", flush=True)
 
