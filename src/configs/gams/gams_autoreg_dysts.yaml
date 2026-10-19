@@ -5,33 +5,38 @@ data:                          # -> for_dysts.dysts_data.load_dysts_system
   train_horizon: 200           # rollout length of the training windows (free-running)
   val_starts: [200, 400, 600, 800, 1000]   # val windows in the val_file trajectory
   val_horizon: 200
-  train_file: train            # train (values[:1000]) and test (values[1000:1200]), as the N-BEATS script
-  val_file: test               # val trajectory (different initial condition)
+  train_file: test             # fit on test values[:1000], test on test values[1000:1200] (as the dysts paper)
+  val_file: train              # val windows from the train-file trajectory
 
 model:                         # -> for_dysts.dysts_gam_model.DystsGAMConfig
-  lags: [1, 3, 9, 27]          # per coordinate; inputs = D * len(lags); null = 1..history_length
+  lags: [1, 8, 20]          # per coordinate; inputs = D * len(lags); null = 1..history_length
   arity: 2                     # 2 = pairwise interactions (incl. across coordinates)
   use_linear: true
   use_cubic: true
   use_raw_linear: true
   mixing_layer_on: false
   final_linear_layer_regularizer: null
-  ridge_alphas: [0.1, 1.0, 10.0]   # RidgeCV default grid
+  ridge_alphas: [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0]   # RidgeCV default grid
   ridge_max_rows: 1000000          # cap on train rows (window x step) for the ridge fit
   ridge_batch: 4096
   feedback_clip: 3.0           # clip each fed-back prediction to [-3, 3] (z space); null = off
   predict_increment: false     # true: each GAM outputs (x[t] - x[t-1]) / dt in the original units
 
 training:                      # -> for_dysts.dysts_training_loop.DystsTrainConfig
-  max_epochs: 100              # Darts default (N-BEATS)
+  max_epochs: 1000              # Darts default (N-BEATS)
   batch_size: 32               # Darts default
   batches_per_epoch: null      # null = one pass over the training windows
   accumulate_grad_batches: 1
   learning_rate: 0.01          # ECBase default
   weight_decay: 0.004          # keras AdamW default
   ema_momentum: 0.99           # keras optimizer EMA default
-  global_clipnorm: null        # gradient clipping (null = off)
+  global_clipnorm: 20.0        # gradient clipping: global norm of each update scaled to <= 20 (null = off)
   patience: null               # early stopping on val_smape (null = off)
+  max_epoch_retries: 5         # bad epoch e -> go back to the end of epoch e-2 (start if e < 2) and continue
+                               # with new batch orders; epoch e bad more than this many times -> stop, use the best epoch
+  rollback_keep_epochs: 10     # end-of-epoch states kept for going back (plus the initial state)
+  rollback_grad_norm: 10000000     # bad epoch: a batch gradient norm (before clipping) above this (null = off)
+  rollback_frac_clipped: 0.1   # bad epoch: mean frac_clipped above this (null = off)
   fit_ridge: true
 
 evaluation:

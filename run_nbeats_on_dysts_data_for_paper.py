@@ -8,7 +8,6 @@ comparable to the stored results file
 Configuration:
   * multivariate, 100 timepoints per period, 12 periods (1200 points/trajectory)
   * noise-free
-  * train and test trajectories from DIFFERENT initial conditions (separate files)
   * split: split_point = int(5/6 * len) = 1000 train / 200 forecast
   * N-BEATS hyperparameters loaded per-system from the tuned hyperparameter JSON
   * scoring via dysts.metrics.compute_metrics; smape overridden to 0-200 scale
@@ -129,8 +128,8 @@ def main():
     trainer_kwargs, has_gpu = get_trainer_kwargs()
     vprint(f"has gpu: {has_gpu}")
 
-    train_path = os.path.join(args.data_dir, f"train_{DATANAME}.json.gz")
-    equation_data = load_gz_json(train_path)
+    data_path  = os.path.join(args.data_dir, f"test_{DATANAME}.json.gz")
+    equation_data = load_gz_json(data_path )
     all_hp = json.load(open(args.hyperparameter_file))
     lyap = load_lyapunov(args.lyapunov_file)
 

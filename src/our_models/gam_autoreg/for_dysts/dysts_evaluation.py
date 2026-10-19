@@ -25,6 +25,7 @@ from typing import Optional
 
 import dysts.metrics
 import numpy as np
+import warnings
 
 from src.metrics import smape_0_200, valid_horizon
 from our_models.gam_autoreg.windows import EvalWindows
@@ -39,25 +40,27 @@ def score_window(y_true: np.ndarray, y_pred: np.ndarray, dt: float, lam: Optiona
     One forecast, y [H, D] original scale. Same code path as run_system() in
     run_nbeats_on_dysts_data_for_paper.py (including the ValueError fallback).
     """
-    try:
-        if not np.all(np.isfinite(y_pred)):
-            raise ValueError("non-finite forecast")
-        metrics = dysts.metrics.compute_metrics(y_true, y_pred)
-        metrics["smape"] = smape_0_200(y_true, y_pred)
-        step, t, lyap, per_step = valid_horizon(y_true, y_pred, dt, lam, threshold)
-        metrics["valid_horizon_step"] = step
-        metrics["valid_horizon_time"] = t
-        metrics["valid_horizon_lyap"] = lyap
-        metrics["horizon_smape_0_100"] = per_step
-    except ValueError:
-        metrics = dysts.metrics.compute_metrics(y_true, y_true)
-        for k in metrics:
-            metrics[k] = None
-        metrics["smape"] = None
-        metrics["valid_horizon_step"] = None
-        metrics["valid_horizon_time"] = None
-        metrics["valid_horizon_lyap"] = None
-        metrics["horizon_smape_0_100"] = None
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="nperseg = .* is greater than input length")
+        try:
+            if not np.all(np.isfinite(y_pred)):
+                raise ValueError("non-finite forecast")
+            metrics = dysts.metrics.compute_metrics(y_true, y_pred)
+            metrics["smape"] = smape_0_200(y_true, y_pred)
+            step, t, lyap, per_step = valid_horizon(y_true, y_pred, dt, lam, threshold)
+            metrics["valid_horizon_step"] = step
+            metrics["valid_horizon_time"] = t
+            metrics["valid_horizon_lyap"] = lyap
+            metrics["horizon_smape_0_100"] = per_step
+        except ValueError:
+            metrics = dysts.metrics.compute_metrics(y_true, y_true)
+            for k in metrics:
+                metrics[k] = None
+            metrics["smape"] = None
+            metrics["valid_horizon_step"] = None
+            metrics["valid_horizon_time"] = None
+            metrics["valid_horizon_lyap"] = None
+            metrics["horizon_smape_0_100"] = None
     return {k: (float(v) if isinstance(v, (int, float, np.floating, np.integer)) and k not in _PER_STEP_KEYS
                 else v) for k, v in metrics.items()}
 

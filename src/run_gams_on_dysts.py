@@ -38,6 +38,7 @@ from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 
+import keras
 import numpy as np
 import yaml
 
@@ -133,7 +134,8 @@ def main():
           f"train_windows={len(d.train)} val_windows={len(d.val)} lags={gam_cfg.lags} "
           f"inputs/GAM={d.dim * len(gam_cfg.lags)} load_time={time.time() - t0:.1f}s", flush=True)
 
-    # 2. model
+    # 2. model (initial weights from --seed)
+    keras.utils.set_random_seed(args.seed)
     model = DystsGAM(gam_cfg, dim=d.dim, dt=d.dt)
     print(f"[{args.system}] {d.dim} GAMs x {model.n_features} features", flush=True)
 

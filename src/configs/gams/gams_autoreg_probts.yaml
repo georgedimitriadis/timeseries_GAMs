@@ -12,13 +12,13 @@ model:                         # -> basis_gam_model.GAMConfig
   use_raw_linear: true
   mixing_layer_on: false
   final_linear_layer_regularizer: null
-  ridge_alphas: [0.1, 1.0, 10.0]   # RidgeCV default grid
+  ridge_alphas: [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]   # RidgeCV default grid
   ridge_max_rows: 200000 # 1000000          # cap on rows per split (train / val) for the ridge fit
-  ridge_batch: 512 # 4096
-  feedback_clip: 3.0             # clip each fed-back prediction to [-3, 3] (z space); null = off
+  ridge_batch: 4096 # 4096
+  feedback_clip: 2.0             # clip each fed-back prediction to [-3, 3] (z space); null = off
 
 training:                      # -> for_probts.probts_training_loop.TrainConfig (other fields from the ProbTS yaml)
-  learning_rate: 0.05          # ECBase default
+  learning_rate: 0.01          # ECBase default
   weight_decay: 0.004          # keras AdamW default
   ema_momentum: 0.99           # keras optimizer EMA default
   fit_ridge: true
