@@ -54,6 +54,7 @@ mkdir -p "$OUTDIR"
 # ---- run loop ----
 for i in $(seq 1 "$N"); do
   OUTFILE="${OUTDIR}/${OUTBASE}_v${i}.json"
-  echo "=== run ${i}/${N} -> ${OUTFILE} ==="
-  "$PYTHON" "$SCRIPT" "${PASS_ARGS[@]}" --outfile "$OUTFILE"
+  MODELDIR="${OUTDIR}/${OUTBASE}_v${i}_models"
+  echo "=== run ${i}/${N} -> ${OUTFILE}, models -> ${MODELDIR} ==="
+  "$PYTHON" "$SCRIPT" "${PASS_ARGS[@]}" --outfile "$OUTFILE" --model-dir "$MODELDIR"
 done

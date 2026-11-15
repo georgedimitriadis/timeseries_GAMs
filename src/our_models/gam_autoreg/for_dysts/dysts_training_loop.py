@@ -32,8 +32,24 @@ What it does
    been bad more than max_epoch_retries times: training stops; the best epoch so far
    is used (as early stopping). The best weights are kept even if their epoch is redone.
 3. After every epoch: evaluate(val) with the Dense(1) heads; the weights of the epoch
-   with the lowest val sMAPE are kept (select_metric="val_smape"). Optional early
-   stopping after `patience` epochs without improvement.
+   with the lowest val sMAPE are kept (select_metric="val_smape"); with
+   select_smoothing = k > 1 the score of epoch c is the select_stat (mean, median or
+   max) of the val sMAPE of the k epochs centred on c (c - (k-1)//2 .. c + k//2), known k//2 epochs later; the EMA weights of
+   the last (k-1)//2 + 1 epochs are kept for this. If no full window is available
+   (training stopped early), the epoch with the lowest raw val sMAPE is used.
+   select_last_epochs = N > 0: only epochs among the last N epochs of training (counted
+   back from the last accepted epoch) can be picked; the best of them is tracked during
+   training with a sliding-window minimum (EMA weights kept only for epochs that can still
+   become that minimum). If none of the last N epochs has a score, the best epoch over
+   all epochs is used.
+   Optional early stopping after `patience` epochs without improvement of that score.
+   Learning rate: constant, or cosine decay from learning_rate to lr_min over
+   max_epochs (lr_schedule="cosine"); the schedule follows the optimiser step counter,
+   so a rollback also restores the learning rate.
+   If `test` windows are given, evaluate(test) also runs after every epoch (Dense(1)
+   heads), for monitoring only: it is not used to pick the epoch.
+   result.val_results / result.test_results: val / test sMAPE per accepted epoch
+   (same order as result.history; epochs undone by a rollback are removed).
 4. Puts the best weights in the model and fits one RidgeCV head per coordinate on
    rollout features (model.fit_ridge); reports val metrics with both heads.
 """
@@ -67,7 +83,9 @@ class DystsTrainConfig:
     batch_size: int = 32                    # Darts default batch_size
     batches_per_epoch: Optional[int] = None # None = one pass over the training windows
     accumulate_grad_batches: int = 1
-    learning_rate: float = 0.01             # ECBase default
+    learning_rate: float = 0.01             # ECBase default (initial value with a schedule)
+    lr_schedule: str = "constant"           # "constant" | "cosine" (cosine decay over max_epochs)
+    lr_min: float = 0.0                     # final learning rate of the cosine schedule
     weight_decay: float = 0.004             # keras AdamW default
     ema_momentum: float = 0.99              # keras optimizer EMA default
     global_clipnorm: Optional[float] = None # gradient clipping (None = off)
@@ -80,6 +98,10 @@ class DystsTrainConfig:
     rollback_grad_norm: Optional[float] = 100.0       # bad if a batch grad norm exceeds it (None = off)
     rollback_frac_clipped: Optional[float] = 0.1      # bad if the epoch mean frac_clipped exceeds it (None = off)
     select_metric: str = "val_smape"        # lower = better
+    select_smoothing: int = 1               # pick the epoch with the lowest select_stat of select_metric
+                                            # over the k epochs centred on it; 1 = raw
+    select_stat: str = "mean"               # "mean" | "median" | "max" (max: worst epoch of the window)
+    select_last_epochs: int = -1            # pick only among the last N epochs of training (-1 = all)
     fit_ridge: bool = True
     seed: int = 0
     verbose: bool = True
@@ -94,6 +116,11 @@ class DystsTrainResult:
     history: list = field(default_factory=list)
     rollbacks: list = field(default_factory=list)   # {"epoch", "retry", "reason", "restart_epoch"} per bad run
     stopped_diverged: Optional[dict] = None         # {"epoch", "reason"} if stopped after max_epoch_retries
+    val_results: list = field(default_factory=list)  # val sMAPE per epoch (Dense(1) heads)
+    val_results_smoothed: list = field(default_factory=list)  # centred select_stat per epoch (None at the ends)
+    test_results: list = field(default_factory=list) # test sMAPE per epoch (Dense(1) heads; monitoring only)
+    train_loss_results: list = field(default_factory=list)  # mean train loss per epoch (MSE + penalties)
+    train_mse_results: list = field(default_factory=list)   # mean train MSE per epoch (z space)
     val_dense: Optional[dict] = None        # val metrics, Dense(1) heads
     val_ridge: Optional[dict] = None        # val metrics, ridge heads
     ridge: Optional[list] = None            # per coordinate: alpha, rows
@@ -151,7 +178,8 @@ def make_train_fns(model: DystsGAM, optimizer, ema_momentum: float):
 # Training loop
 # ----------------------------------------------------------------------
 def train_dysts_gam(model: DystsGAM, train: TrainWindows, val: EvalWindows,
-                    cfg: DystsTrainConfig, evaluate: Callable[..., dict]) -> DystsTrainResult:
+                    cfg: DystsTrainConfig, evaluate: Callable[..., dict],
+                    test: Optional[EvalWindows] = None) -> DystsTrainResult:
     if val is None:
         raise ValueError("A validation set is needed (epoch selection and RidgeCV).")
     t_start = time.time()
@@ -167,15 +195,33 @@ def train_dysts_gam(model: DystsGAM, train: TrainWindows, val: EvalWindows,
     model.fit_scaler(train)
 
     # 2. optimiser state (keras stateless API), all D networks together
-    optimizer = keras.optimizers.AdamW(learning_rate=cfg.learning_rate,
+    accum = max(int(cfg.accumulate_grad_batches), 1)
+    n_batches = len(epoch_batches(len(train), cfg.batch_size, np.random.default_rng(0),
+                                  cfg.batches_per_epoch))
+    updates_per_epoch = -(-n_batches // accum)                # ceil
+    if cfg.lr_schedule == "cosine":
+        lr = keras.optimizers.schedules.CosineDecay(
+            initial_learning_rate=cfg.learning_rate,
+            decay_steps=max(cfg.max_epochs * updates_per_epoch, 1),
+            alpha=cfg.lr_min / cfg.learning_rate)
+    elif cfg.lr_schedule == "constant":
+        lr = cfg.learning_rate
+    else:
+        raise ValueError(f"lr_schedule {cfg.lr_schedule!r}: use 'constant' or 'cosine'")
+    optimizer = keras.optimizers.AdamW(learning_rate=lr,
                                        weight_decay=cfg.weight_decay,
                                        global_clipnorm=cfg.global_clipnorm)
     optimizer.build(model.trainable_variables)
     opt_vars = [v.value for v in optimizer.variables]
+    it_idx = next((i for i, v in enumerate(optimizer.variables) if v is optimizer.iterations), None)
+
+    def current_lr(ov):                                       # learning rate of the next update (log)
+        if not callable(lr):
+            return float(lr)
+        return float(lr(ov[it_idx])) if it_idx is not None else None
     tv, ntv = list(model.tv), list(model.ntv)
     ema = [jnp.array(v) for v in tv]
     compute_grads, apply_grads = make_train_fns(model, optimizer, cfg.ema_momentum)
-    accum = max(int(cfg.accumulate_grad_batches), 1)
 
     def run_epoch(tv, ntv, opt_vars, ema, batches):
         """One epoch. Returns (tv, ntv, opt_vars, ema, stats, bad_reason or None)."""
@@ -214,7 +260,16 @@ def train_dysts_gam(model: DystsGAM, train: TrainWindows, val: EvalWindows,
             return tv, ntv, opt_vars, ema, st, "non-finite weights"
         return tv, ntv, opt_vars, ema, st, None
 
-    best = {"score": np.inf, "epoch": -1, "tv": ema, "ntv": ntv}
+    best = {"score": np.inf, "epoch": -1, "tv": ema, "ntv": ntv}       # selection (smoothed)
+    best_raw = dict(best)                                               # fallback: raw val score
+    k_sm = max(int(cfg.select_smoothing), 1)
+    stat_fn = {"mean": np.mean, "median": np.median, "max": np.max}.get(cfg.select_stat)
+    if stat_fn is None:
+        raise ValueError(f"select_stat {cfg.select_stat!r}: use 'mean', 'median' or 'max'")
+    half = (k_sm - 1) // 2                                              # centre = half epochs back
+    recent_ema = {}                                    # epoch -> (EMA weights, ntv), last half+1 epochs
+    n_last = int(cfg.select_last_epochs)
+    cand = []      # select_last_epochs > 0: (score, centre, scored_at, tv, ntv), scores increasing
     history, rollbacks, since_best, stopped = [], [], 0, None
     snapshots = {-1: (tv, opt_vars, ema)}      # end-of-epoch states (tv, opt_vars, ema); -1 = initial
     n_bad = {}                                 # epoch -> number of bad runs
@@ -239,6 +294,8 @@ def train_dysts_gam(model: DystsGAM, train: TrainWindows, val: EvalWindows,
                 break
             history = [h for h in history if h["epoch"] <= back]
             snapshots = {k: v for k, v in snapshots.items() if k <= back}
+            recent_ema = {k: v for k, v in recent_ema.items() if k <= back}
+            cand = [c for c in cand if c[2] <= back]          # scores computed from undone epochs
             epoch = back + 1
             continue
         tv, opt_vars, ema = tv_e, opt_e, ema_e
@@ -249,23 +306,59 @@ def train_dysts_gam(model: DystsGAM, train: TrainWindows, val: EvalWindows,
         # 3. validation with the EMA weights, Dense(1) heads
         model.set_params(ema, ntv)
         val_m = evaluate(model, val, stage="val", use_ridge=False)
-        score = val_m.get(sel)
-        rec = {"epoch": epoch, **st, "retries": n_bad.get(epoch, 0), sel: score,
+        raw = val_m.get(sel)
+        test_m = evaluate(model, test, stage="test", use_ridge=False) if test is not None else {}
+        rec = {"epoch": epoch, **st, "retries": n_bad.get(epoch, 0), "lr": current_lr(opt_vars),
+               sel: raw, f"{sel}_smoothed": None,
                "val_valid_horizon_lyap": val_m.get("val_valid_horizon_lyap"),
+               "test_smape": test_m.get("test_smape"),
+               "test_valid_horizon_lyap": test_m.get("test_valid_horizon_lyap"),
                "epoch_time_s": round(time.time() - t0, 2)}
         history.append(rec)
+        finite = lambda x: x is not None and np.isfinite(x)
+        if finite(raw) and raw < best_raw["score"]:
+            best_raw = {"score": float(raw), "epoch": epoch, "tv": [jnp.array(e) for e in ema], "ntv": ntv}
+
+        # smoothed selection: select_stat over the k_sm epochs centred on epoch c = epoch - half
+        recent_ema[epoch] = ([jnp.array(e) for e in ema], ntv)
+        recent_ema = {k: v for k, v in recent_ema.items() if k >= epoch - half}
+        improved = False
+        if len(history) >= k_sm:
+            window = [h[sel] for h in history[-k_sm:]]
+            centre = history[-1 - half]
+            if all(finite(w) for w in window) and centre["epoch"] in recent_ema:
+                score = float(stat_fn(window))
+                centre[f"{sel}_smoothed"] = score
+                rec["smoothed_centre"] = centre["epoch"]
+                rec["smoothed_score"] = score
+                w_tv, w_ntv = recent_ema[centre["epoch"]]
+                if score < best["score"]:
+                    best = {"score": score, "epoch": centre["epoch"], "tv": w_tv, "ntv": w_ntv}
+                    improved = True
+                if n_last > 0:                                # sliding-window minimum
+                    while cand and cand[-1][0] >= score:
+                        cand.pop()
+                    cand.append((score, centre["epoch"], epoch, w_tv, w_ntv))
+        if n_last > 0:
+            cand = [c for c in cand if c[1] > epoch - n_last]
         log(rec)
-        if score is not None and np.isfinite(score) and score < best["score"]:
-            best = {"score": float(score), "epoch": epoch,
-                    "tv": [jnp.array(e) for e in ema], "ntv": ntv}
-            since_best = 0
-        else:
-            since_best += 1
+        since_best = 0 if improved else since_best + 1
         if cfg.patience is not None and since_best >= cfg.patience:
             log({"early_stop": epoch, "best_epoch": best["epoch"]})
             break
         epoch += 1
 
+    if n_last > 0 and history:                # best among the last n_last epochs of training
+        last = history[-1]["epoch"]
+        cand = [c for c in cand if c[1] > last - n_last]
+        if cand:
+            score, c_ep, _, w_tv, w_ntv = cand[0]
+            best = {"score": score, "epoch": c_ep, "tv": w_tv, "ntv": w_ntv}
+        else:
+            log({"select_last_epochs": n_last, "note": "no scored epoch in that range; "
+                 "using the best epoch over all epochs", "best_epoch": best["epoch"]})
+    if best["epoch"] < 0:                     # fewer than select_smoothing finite epochs
+        best = best_raw
     if best["epoch"] < 0:
         raise RuntimeError(f"No epoch had a finite {sel}; see the epoch log.")
 
@@ -273,7 +366,12 @@ def train_dysts_gam(model: DystsGAM, train: TrainWindows, val: EvalWindows,
     model.set_params(best["tv"], best["ntv"])
     result = DystsTrainResult(best_epoch=best["epoch"], best_score=best["score"],
                               selection_metric=sel, epochs_run=len(history), history=history,
-                              rollbacks=rollbacks, stopped_diverged=stopped)
+                              rollbacks=rollbacks, stopped_diverged=stopped,
+                              val_results=[h[sel] for h in history],
+                              val_results_smoothed=[h[f"{sel}_smoothed"] for h in history],
+                              test_results=[h["test_smape"] for h in history],
+                              train_loss_results=[h["train_loss"] for h in history],
+                              train_mse_results=[h["train_mse"] for h in history])
     result.val_dense = evaluate(model, val, stage="val", use_ridge=False)
     if cfg.fit_ridge:
         ridge = model.fit_ridge(train, val)

@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# Paper-style long-horizon evaluation (Gilpin, Phys. Rev. Research 2023, Appendix A) of the
+# trained dysts GAMs: one run of src/analysis/chaos_results/horizon_calculator.py per system that has
+# <ROOT_DIR>/<system>/gam_state.pkl (written by run_gams_dysts_all_systems.sh), in parallel on CPU.
+#
+# Usage:
+#   ./run_dysts_paper_horizon_all_systems.sh [extra args for horizon_calculator.py]
+#   e.g. ./run_dysts_paper_horizon_all_systems.sh --n_periods 50 --use_ridge false
+#
+# Skipped systems (SKIP_SYSTEMS below): their true trajectory cannot be continued from one stored
+# point with dysts, so the long-horizon truth is not available:
+#   - post-processed systems: dysts make_trajectory(postprocess=True) stores sin/cos of angles or
+#     of the forcing phase (or polar -> Cartesian), so the raw state is not in the data
+#   - delay systems: need a history as initial condition (removed from recent dysts versions)
+#
+# Environment variables (optional):
+#   TOTAL_CPUS=40      CPUs considered (FIRST_CPU .. FIRST_CPU+TOTAL_CPUS-1)
+#   CORES_PER_JOB=1    cores per run
+#   FIRST_CPU=0        first CPU id considered
+#   BUSY_PCT=30        a CPU whose use by other processes is above this (%) is skipped
+#   SAMPLE_SECONDS=5   length of the CPU-use measurement
+#   RECHECK=1          before each job, re-measure the worker's CPUs; if busy, wait
+#   RECHECK_WAIT=60    seconds between re-measurements of a busy worker
+#   MAX_WAIT=3600      a worker whose CPUs stay busy this long stops (its jobs go to others);
+#                      systems never started are listed in <LOG_DIR>/not_run.txt
+#   SYSTEMS="Lorenz Rossler"   subset of systems (default: all with gam_state.pkl); the skip list
+#                      still applies
+#   ROOT_DIR=src/exps/2026_11_dysts_gams_ar2_3lags   folder with one sub-folder per trained system
+#   MIN_AGREE=150      summary: a system counts only if its integrated truth matches the stored
+#                      data for at least this many of the first 200 steps (truth_agreement_steps)
+#   DRY_RUN=1          only print the CPU measurement, the skipped systems, the commands and
+#                      the worker/core assignment
+#
+# CPU selection and scheduling: as run_gams_dysts_all_systems.sh (free CPUs measured from
+# /proc/stat, one shared queue, workers pinned with taskset, systems in alphabetical order).
+#
+# Output: <ROOT_DIR>/<system>/{gams_horizon.json, gams_horizon.npz}
+#         <ROOT_DIR>/gams_horizon_logs/<system>.log    (stdout + stderr of each run)
+#         <ROOT_DIR>/gams_horizon_all_systems.pkl      pandas DataFrame, one row per system;
+#                                                       df.attrs["summary"]: mean / std / sem / median
+#                                                       of the valid horizon (Lyapunov times) over the
+#                                                       usable systems
+#         <ROOT_DIR>/gams_horizon_all_systems.csv      the same table as CSV
+
+THIS_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EXTRA_ARGS=("$@")
+
+TOTAL_CPUS="${TOTAL_CPUS:-10}"
+CORES_PER_JOB="${CORES_PER_JOB:-1}"
+FIRST_CPU="${FIRST_CPU:-16}"
+BUSY_PCT="${BUSY_PCT:-30}"
+SAMPLE_SECONDS="${SAMPLE_SECONDS:-5}"
+RECHECK="${RECHECK:-1}"
+RECHECK_WAIT="${RECHECK_WAIT:-60}"
+MAX_WAIT="${MAX_WAIT:-3600}"
+MIN_AGREE="${MIN_AGREE:-150}"
+DRY_RUN="${DRY_RUN:-0}"
+
+DATA_DIR="${THIS_REPO}/dysts_data/dysts_data/data"
+ROOT_DIR="${ROOT_DIR:-${THIS_REPO}/src/exps/2026_11_dysts_gams_ar2_3lags}"
+LOG_DIR="${ROOT_DIR}/gams_horizon_logs"
+SCRIPT="${THIS_REPO}/src/analysis/chaos_results/horizon_calculator.py"
+MERGE_SCRIPT="${THIS_REPO}/src/analysis/chaos_results/merge_horizon_results.py"
+OUT_CSV="${ROOT_DIR}/gams_horizon_all_systems.csv"
+OUT_PKL="${ROOT_DIR}/gams_horizon_all_systems.pkl"
+
+# ---------------------------------------------------------------------------
+# Systems not evaluated (true trajectory cannot be continued from one stored point)
+# ---------------------------------------------------------------------------
+SKIP_POSTPROCESSED=(
+    ArnoldBeltramiChildress ArnoldWeb BickleyJet BlinkingRotlet CircadianRhythm DoubleGyre
+    DoublePendulum Duffing FluidTrampoline ForcedBrusselator ForcedFitzHughNagumo
+    ForcedVanDerPol LidDrivenCavityFlow OscillatingFlow StickSlipOscillator SwingingAtwood
+    TurchinHanski
+)
+SKIP_DELAY=(IkedaDelay MackeyGlass ScrollDelay SprottDelay VossDelay)
+SKIP_SYSTEMS=("${SKIP_POSTPROCESSED[@]}" "${SKIP_DELAY[@]}")
+
+export PYTHONPATH="${THIS_REPO}:${THIS_REPO}/src:${THIS_REPO}/ptsbenchmark:${PYTHONPATH:-}"
+export KERAS_BACKEND=jax
+export JAX_PLATFORMS=cpu          # CPU only
+export CUDA_VISIBLE_DEVICES=""
+export OMP_NUM_THREADS="${CORES_PER_JOB}"
+export MKL_NUM_THREADS="${CORES_PER_JOB}"
+export OPENBLAS_NUM_THREADS="${CORES_PER_JOB}"
+if [ "${CORES_PER_JOB}" -eq 1 ]; then
+    export XLA_FLAGS="--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
+fi
+
+if [ $(( FIRST_CPU + TOTAL_CPUS )) -gt "$(nproc --all)" ]; then
+    echo "CPUs ${FIRST_CPU}-$(( FIRST_CPU + TOTAL_CPUS - 1 )) requested, machine has $(nproc --all)"; exit 1
+fi
+mkdir -p "${LOG_DIR}"
+
+# ---------------------------------------------------------------------------
+# CPU use from /proc/stat: prints "<cpu id> <% busy>" per CPU over <seconds>
+# ---------------------------------------------------------------------------
+cpu_usage() {
+    local a b
+    a=$(grep '^cpu[0-9]' /proc/stat)
+    sleep "$1"
+    b=$(grep '^cpu[0-9]' /proc/stat)
+    paste -d' ' <(echo "${a}") <(echo "${b}") | awk '{
+        n = NF / 2; ta = 0; tb = 0
+        for (i = 2; i <= n; i++) ta += $i
+        for (i = n + 2; i <= NF; i++) tb += $i
+        ia = $5 + $6; ib = $(n + 5) + $(n + 6); d = tb - ta
+        p = (d > 0) ? 100 * (1 - (ib - ia) / d) : 0
+        sub("cpu", "", $1); printf "%s %.0f\n", $1, p }'
+}
+
+cpus_busy() {  # cpus_busy "3,7" -> exit 0 if any of these CPUs is above BUSY_PCT
+    local list=",$1,"
+    cpu_usage "${SAMPLE_SECONDS}" | awk -v list="${list}" -v lim="${BUSY_PCT}" \
+        'index(list, "," $1 ",") && $2 > lim { busy = 1 } END { exit busy ? 0 : 1 }'
+}
+
+# ---------------------------------------------------------------------------
+# Job list: systems with gam_state.pkl (or SYSTEMS), alphabetical, minus the skip list
+# ---------------------------------------------------------------------------
+if [ -n "${SYSTEMS:-}" ]; then
+    read -r -a CANDIDATES <<< "${SYSTEMS}"
+else
+    mapfile -t CANDIDATES < <(find "${ROOT_DIR}" -mindepth 2 -maxdepth 2 -name gam_state.pkl \
+                              -printf '%h\n' | xargs -r -n1 basename | sort)
+fi
+JOBS=()
+SKIPPED=()
+for s in "${CANDIDATES[@]}"; do
+    if printf '%s\n' "${SKIP_SYSTEMS[@]}" | grep -qxF "${s}"; then
+        SKIPPED+=("${s}")
+    elif [ ! -f "${ROOT_DIR}/${s}/gam_state.pkl" ]; then
+        echo "WARNING: ${s}: no ${ROOT_DIR}/${s}/gam_state.pkl, not run"
+    else
+        JOBS+=("${s}")
+    fi
+done
+echo "skipped (post-processed / delay): ${#SKIPPED[@]}: ${SKIPPED[*]:-none}"
+[ "${#JOBS[@]}" -eq 0 ] && { echo "No systems to run (no gam_state.pkl under ${ROOT_DIR})"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Free CPUs at the start -> worker CPU groups
+# ---------------------------------------------------------------------------
+echo "Measuring CPU use over ${SAMPLE_SECONDS}s (busy above ${BUSY_PCT}%) ..."
+FREE_CPUS=()
+BUSY_LIST=()
+while read -r cpu pct; do
+    (( cpu < FIRST_CPU || cpu >= FIRST_CPU + TOTAL_CPUS )) && continue
+    if (( pct > BUSY_PCT )); then BUSY_LIST+=("${cpu}:${pct}%"); else FREE_CPUS+=("${cpu}"); fi
+done < <(cpu_usage "${SAMPLE_SECONDS}")
+echo "busy CPUs (skipped): ${BUSY_LIST[*]:-none}"
+echo "free CPUs: ${#FREE_CPUS[@]}"
+
+N_WORKERS=$(( ${#FREE_CPUS[@]} / CORES_PER_JOB ))
+[ "${N_WORKERS}" -eq 0 ] && { echo "No free CPUs (need ${CORES_PER_JOB} per job)"; exit 1; }
+WORKER_CPUS=()
+for (( w = 0; w < N_WORKERS; w++ )); do
+    group=("${FREE_CPUS[@]:$(( w * CORES_PER_JOB )):${CORES_PER_JOB}}")
+    WORKER_CPUS+=("$(IFS=,; echo "${group[*]}")")
+done
+
+job_cmd() {   # prints the python command for one system
+    local system=$1
+    echo python "${SCRIPT}" --system "${system}" --run_dir "${ROOT_DIR}/${system}" \
+        --data_dir "${DATA_DIR}" --lyapunov_file "${DATA_DIR}/lyapunov_exponents_qr.txt" "${EXTRA_ARGS[@]}"
+}
+
+QUEUE="${LOG_DIR}/.queue_counter"
+
+next_job() {  # atomically take the next job index from the shared counter
+    (
+        flock -x 9
+        local i
+        i=$(cat "${QUEUE}")
+        echo $(( i + 1 )) > "${QUEUE}"
+        echo "${i}"
+    ) 9>"${QUEUE}.lock"
+}
+
+wait_until_free() {  # worker w: wait while its CPUs are busy; exit 1 after MAX_WAIT seconds
+    local w=$1 cpus=$2 waited=0
+    [ "${RECHECK}" == "1" ] || return 0
+    while cpus_busy "${cpus}"; do
+        if (( waited >= MAX_WAIT )); then
+            echo "[$(date '+%F %T')] worker ${w} (cpus ${cpus}) STOP: CPUs busy for ${waited}s"
+            return 1
+        fi
+        echo "[$(date '+%F %T')] worker ${w} (cpus ${cpus}) WAIT: CPUs busy, recheck in ${RECHECK_WAIT}s"
+        sleep "${RECHECK_WAIT}"
+        waited=$(( waited + RECHECK_WAIT + SAMPLE_SECONDS ))
+    done
+    return 0
+}
+
+worker() {    # worker w: pinned to its own CPUs, takes systems until the queue is empty
+    local w=$1
+    local cpus="${WORKER_CPUS[$w]}"
+    local i system log cmd
+    while true; do
+        if [ "${DRY_RUN}" != "1" ]; then
+            wait_until_free "${w}" "${cpus}" || break        # before taking a job: none is lost
+        fi
+        i=$(next_job)
+        [ "${i}" -ge "${#JOBS[@]}" ] && break
+        system="${JOBS[$i]}"
+        log="${LOG_DIR}/${system}.log"
+        cmd=$(job_cmd "${system}")
+        if [ "${DRY_RUN}" == "1" ]; then
+            echo "[worker ${w} | cpus ${cpus}] job ${i} ${system}: ${cmd}"
+            continue
+        fi
+        echo "[$(date '+%F %T')] worker ${w} (cpus ${cpus}) START ${system}"
+        echo "${system}" >> "${LOG_DIR}/started.txt"
+        taskset -c "${cpus}" ${cmd} > "${log}" 2>&1
+        local rc=$?
+        if [ "${rc}" -eq 0 ]; then
+            echo "[$(date '+%F %T')] worker ${w} DONE  ${system}"
+        else
+            echo "[$(date '+%F %T')] worker ${w} FAIL  ${system} (exit ${rc}, see ${log})"
+            echo "${system} ${rc}" >> "${LOG_DIR}/failed.txt"
+        fi
+    done
+}
+
+echo "${#JOBS[@]} systems, ${N_WORKERS} workers x ${CORES_PER_JOB} cores"
+for (( w = 0; w < N_WORKERS; w++ )); do echo "  worker ${w}: cpus ${WORKER_CPUS[$w]}"; done
+echo "extra args: ${EXTRA_ARGS[*]:-none}"
+rm -f "${LOG_DIR}/failed.txt" "${LOG_DIR}/started.txt" "${LOG_DIR}/not_run.txt"
+echo 0 > "${QUEUE}"
+
+for (( w = 0; w < N_WORKERS && w < ${#JOBS[@]}; w++ )); do
+    worker "${w}" &
+done
+wait
+rm -f "${QUEUE}" "${QUEUE}.lock"
+[ "${DRY_RUN}" == "1" ] && exit 0
+
+# ---------------------------------------------------------------------------
+# Merge <ROOT_DIR>/<system>/gams_horizon.json -> CSV table + summary over usable systems
+# (src/analysis/chaos_results/merge_horizon_results.py)
+# ---------------------------------------------------------------------------
+python "${MERGE_SCRIPT}" --root_dir "${ROOT_DIR}" --out_csv "${OUT_CSV}" \
+    --out_pkl "${OUT_PKL}" --min_agree "${MIN_AGREE}" --systems "${JOBS[@]}"
+
+NOT_RUN=()
+for s in "${JOBS[@]}"; do
+    grep -qxF "${s}" "${LOG_DIR}/started.txt" 2>/dev/null || NOT_RUN+=("${s}")
+done
+if [ "${#NOT_RUN[@]}" -gt 0 ]; then
+    echo "Not run (all workers stopped on busy CPUs): ${NOT_RUN[*]}"
+    printf '%s\n' "${NOT_RUN[@]}" > "${LOG_DIR}/not_run.txt"
+fi
+if [ -s "${LOG_DIR}/failed.txt" ]; then
+    echo "Failed systems (name, exit code):"; cat "${LOG_DIR}/failed.txt"
+elif [ "${#NOT_RUN[@]}" -eq 0 ]; then
+    echo "All systems finished."
+fi

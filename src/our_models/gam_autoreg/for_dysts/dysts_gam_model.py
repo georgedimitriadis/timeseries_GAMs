@@ -275,6 +275,27 @@ class DystsGAM(BaseGAM):
             out[f"x{d}"] = a
         return out
 
+    @classmethod
+    def from_state_dict(cls, state: dict) -> "DystsGAM":
+        """Rebuild a trained model from state_dict() (e.g. gam_state.pkl): config, scaler,
+        keras weights (assigned in net.weights order, shapes checked) and ridge heads."""
+        cfg = DystsGAMConfig(**state["config"])
+        model = cls(cfg, dim=int(state["dim"]), dt=float(state["dt"]))
+        model.scaler.lo = np.asarray(state["scaler_lo"], np.float32)
+        model.scaler.hi = np.asarray(state["scaler_hi"], np.float32)
+        for d, (net, saved) in enumerate(zip(model.nets, state["weights"])):
+            arrays = list(saved.values())
+            if len(arrays) != len(net.weights):
+                raise ValueError(f"network {d}: {len(arrays)} saved arrays, {len(net.weights)} weights")
+            for v, a in zip(net.weights, arrays):
+                if tuple(v.shape) != tuple(np.shape(a)):
+                    raise ValueError(f"network {d}: {v.path} shape {tuple(v.shape)} != saved {np.shape(a)}")
+                v.assign(a)
+        model.tv = [v.value for net in model.nets for v in net.trainable_variables]
+        model.ntv = [v.value for net in model.nets for v in net.non_trainable_variables]
+        model.ridge = state.get("ridge")
+        return model
+
     def state_dict(self):
         self.sync_to_keras()
         return {"config": asdict(self.cfg), "dim": self.dim, "dt": self.dt,

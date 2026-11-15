@@ -38,4 +38,13 @@ run_nbeats_on_dysts_data_for_paper_all_systems:
 run_nbeats_on_dysts_data_for_paper_all_systems_multiple_times:
 	CUDA_VISIBLE_DEVICES=0 ./run_nbeats_on_dysts_data_for_paper_repeat.sh 10 --systems all
 
+run_gams_on_dysts_data_all_systems:
+	CUDA_VISIBLE_DEVICES=0 TOTAL_CPUS=8 FIRST_CPU=10 ./run_gams_on_dysts_all_systems.sh
+
+run_horizon_on_gams_results_all_systems:
+	CUDA_VISIBLE_DEVICES=0 ./run_dysts_gams_horizon_on_all_systems.sh
+
+show_nbeats_results_ours_vs_paper:
+	CUDA_VISIBLE_DEVICES=0 python ./src/analysis/chaos_results/nbeats_results_ours_vs_paper.py
+
 

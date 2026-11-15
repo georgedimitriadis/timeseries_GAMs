@@ -3,13 +3,13 @@
 data:                          # -> for_dysts.dysts_data.load_dysts_system
   history_length: 100          # L: values before each forecast start given to the model (>= max lag)
   train_horizon: 200           # rollout length of the training windows (free-running)
-  val_starts: [200, 400, 600, 800, 1000]   # val windows in the val_file trajectory
+  val_starts: [100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 900, 950, 1000]   # val windows in the val_file trajectory
   val_horizon: 200
   train_file: test             # fit on test values[:1000], test on test values[1000:1200] (as the dysts paper)
   val_file: train              # val windows from the train-file trajectory
 
 model:                         # -> for_dysts.dysts_gam_model.DystsGAMConfig
-  lags: [1, 8, 20]          # per coordinate; inputs = D * len(lags); null = 1..history_length
+  lags: [1, 10, 50]          # per coordinate; inputs = D * len(lags); null = 1..history_length
   arity: 2                     # 2 = pairwise interactions (incl. across coordinates)
   use_linear: true
   use_cubic: true
@@ -23,21 +23,26 @@ model:                         # -> for_dysts.dysts_gam_model.DystsGAMConfig
   predict_increment: false     # true: each GAM outputs (x[t] - x[t-1]) / dt in the original units
 
 training:                      # -> for_dysts.dysts_training_loop.DystsTrainConfig
-  max_epochs: 1000              # Darts default (N-BEATS)
+  max_epochs: 5000              # Darts default (N-BEATS)
   batch_size: 32               # Darts default
   batches_per_epoch: null      # null = one pass over the training windows
   accumulate_grad_batches: 1
-  learning_rate: 0.01          # ECBase default
+  learning_rate: 0.0005          # ECBase default
+  lr_schedule: cosine          # constant | cosine (decay from learning_rate to lr_min over max_epochs)
+  lr_min: 0.00005               # final learning rate of the cosine schedule
   weight_decay: 0.004          # keras AdamW default
   ema_momentum: 0.99           # keras optimizer EMA default
   global_clipnorm: 20.0        # gradient clipping: global norm of each update scaled to <= 20 (null = off)
   patience: null               # early stopping on val_smape (null = off)
-  max_epoch_retries: 5         # bad epoch e -> go back to the end of epoch e-2 (start if e < 2) and continue
+  max_epoch_retries: 10         # bad epoch e -> go back to the end of epoch e-2 (start if e < 2) and continue
                                # with new batch orders; epoch e bad more than this many times -> stop, use the best epoch
   rollback_keep_epochs: 10     # end-of-epoch states kept for going back (plus the initial state)
   rollback_grad_norm: 10000000     # bad epoch: a batch gradient norm (before clipping) above this (null = off)
   rollback_frac_clipped: 0.1   # bad epoch: mean frac_clipped above this (null = off)
-  fit_ridge: true
+  select_smoothing: 11         # window of epochs centred on each epoch for its selection score (1 = raw val_smape)
+  select_stat: max             # mean | median | max of val_smape over that window (max: worst epoch of the window)
+  fit_ridge: false
+  select_last_epochs: 1000       # pick only among the last N epochs of training (-1 = all epochs)
 
 evaluation:
   threshold: 50.0              # valid-horizon sMAPE threshold (0-100 scale), as the N-BEATS script

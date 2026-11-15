@@ -30,3 +30,27 @@ def valid_horizon(y_true, y_pred, dt, lam, threshold):
     t = step * dt
     lyap = None if (lam is None or lam == 0) else t * lam
     return step, float(t), (None if lyap is None else float(lyap)), per_step.tolist()
+
+def smape_cumulative_0_200(y_true, y_pred, eps=1e-10):
+    """Running-average sMAPE from the forecast start (0-200 scale), as Gilpin,
+    Phys. Rev. Research 2023 (arXiv 2303.08011), Appendix F:
+        eps(t) = 200 / t * sum_{t'=1..t} |y - yhat| / (|y| + |yhat|)
+    y_true, y_pred: (T, D); mean over D per step, then running mean over steps.
+    Returns array of length T (entry i = eps(t = i + 1))."""
+    y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
+    ratio = np.mean(np.abs(y_true - y_pred) / (np.abs(y_true) + np.abs(y_pred) + eps), axis=1)
+    return 200 * np.cumsum(ratio) / np.arange(1, len(ratio) + 1)
+
+
+def valid_horizon_cumulative(y_true, y_pred, dt, lam, threshold=50.0):
+    """Valid forecast horizon as Gilpin 2023 (Appendix A): latest time t at which the
+    running-average sMAPE (0-200 scale) is below threshold (50 in the paper).
+    t counts forecast steps from 1 (eps(t) averages steps 1..t), so time = t * dt.
+    Returns (steps, time, lyap, cumulative sMAPE per step). steps = 0 if eps(1) >= threshold.
+    lyap = time * lambda_max (None if lam is None or 0)."""
+    cum = smape_cumulative_0_200(y_true, y_pred)
+    below = np.nonzero(cum < threshold)[0]
+    steps = int(below.max()) + 1 if below.size else 0
+    t = steps * dt
+    lyap = None if (lam is None or lam == 0) else t * lam
+    return steps, float(t), (None if lyap is None else float(lyap)), cum.tolist()

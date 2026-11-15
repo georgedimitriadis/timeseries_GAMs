@@ -141,7 +141,7 @@ def main():
 
     # 3. training (+ ridge)
     evaluate = partial(evaluate_dysts, dt=d.dt, lam=d.lyapunov, threshold=threshold)
-    result = train_dysts_gam(model, d.train, d.val, train_cfg, evaluate)
+    result = train_dysts_gam(model, d.train, d.val, train_cfg, evaluate, test=d.test)
 
     # 4. test (one window: values[1000:1200]); final model = ridge heads if fitted
     t_test = time.time()
